@@ -1,0 +1,794 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#14181d">
+<title>Ocean Scan</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="icon-192.png">
+<!--
+  Ocean Scan: read-only Fisker Ocean scanner for a phone (Chrome on Android) + vLinker FD+ over Bluetooth LE.
+  Our own code, written from the public ELM327 command set, ISO 15765-2 (ISO-TP) and ISO 14229 (UDS).
+  No code from Unfiskered GO or any other app.
+
+  SAFETY: the page can only send a fixed allow-list of AT setup commands, UDS 0x22 (read data by ID)
+  and UDS 0x19 02 (read fault codes by status). Everything else is refused in code (guardUds / guardAt).
+  No clearing, resets, writes or security access. VIN is redacted in everything shown and saved.
+-->
+<style>
+/* Layout: one column, a sticky action bar, results as a module list. Instrument-panel feel. */
+:root {
+  --bg: #f3f5f6; --panel: #ffffff; --fg: #15191d; --muted: #5b6670; --line: #d8dee3;
+  --accent: #0a6c8f; --accent-fg: #ffffff;
+  --ok: #1d7a46; --warn: #a15c00; --bad: #b3261e; --off: #6b5aa6;
+  --mono: "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace;
+  --sans: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #111417; --panel: #1a1f24; --fg: #e8edf1; --muted: #9aa6b0; --line: #2c343b;
+  --accent: #4fb3d6; --accent-fg: #0b1215; --ok: #5cc98a; --warn: #f0a843; --bad: #ff7a6e; --off: #b2a4f0;
+  color-scheme: dark } }
+:root[data-theme="dark"] {
+  --bg: #111417; --panel: #1a1f24; --fg: #e8edf1; --muted: #9aa6b0; --line: #2c343b;
+  --accent: #4fb3d6; --accent-fg: #0b1215; --ok: #5cc98a; --warn: #f0a843; --bad: #ff7a6e; --off: #b2a4f0;
+  color-scheme: dark }
+* { box-sizing: border-box }
+html { padding-top: env(safe-area-inset-top, 0px); padding-bottom: env(safe-area-inset-bottom, 0px) }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.45 var(--sans);
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); padding-block: 12px 40px }
+main { max-width: 720px; margin: 0 auto; display: grid; gap: 14px }
+h1 { font-size: 1.35rem; margin: 4px 0 0; letter-spacing: .01em }
+h3 { font-size: .9rem; margin: 14px 0 8px }
+h3:first-of-type { margin-top: 4px }
+h2 { font-size: .78rem; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 0 0 8px; font-weight: 600 }
+p { margin: 0 }
+.sub { color: var(--muted); font-size: .9rem }
+section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; min-width: 0 }
+.row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center }
+button { font: 600 .95rem var(--sans); border-radius: 8px; border: 1px solid var(--line); background: var(--panel); color: var(--fg);
+  padding: 11px 14px; min-height: 44px; cursor: pointer }
+button.primary { background: var(--accent); color: var(--accent-fg); border-color: var(--accent) }
+button:disabled { opacity: .45; cursor: not-allowed }
+button:focus-visible, input:focus-visible, select:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px }
+label { font-size: .85rem; color: var(--muted); display: grid; gap: 4px; flex: 1 1 220px; min-width: 0 }
+input, select { font: .95rem var(--sans); padding: 10px; border-radius: 8px; border: 1px solid var(--line); background: var(--bg); color: var(--fg); width: 100% }
+.status { display: flex; gap: 10px; align-items: center; font-weight: 600 }
+.dot { width: 10px; height: 10px; border-radius: 50%; background: var(--muted); flex: none }
+.dot.on { background: var(--ok) } .dot.busy { background: var(--warn) } .dot.err { background: var(--bad) }
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px }
+.stat { border: 1px solid var(--line); border-radius: 8px; padding: 10px }
+.stat b { display: block; font: 600 1.3rem var(--mono); font-variant-numeric: tabular-nums }
+.stat span { font-size: .78rem; color: var(--muted) }
+.mod { border-top: 1px solid var(--line); padding: 10px 0; display: grid; gap: 4px }
+.mod:first-child { border-top: 0 }
+.mod-head { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; flex-wrap: wrap }
+.mod-name { font-weight: 700 } .mod-addr { font: .8rem var(--mono); color: var(--muted) }
+.pill { font: 600 .72rem var(--sans); padding: 2px 8px; border-radius: 99px; border: 1px solid currentColor; white-space: nowrap }
+.pill.ok { color: var(--ok) } .pill.warn { color: var(--warn) } .pill.bad { color: var(--bad) } .pill.off { color: var(--off) }
+.kv { font: .82rem var(--mono); color: var(--muted); overflow-wrap: anywhere }
+.dtc { font: .88rem var(--mono); display: flex; gap: 8px; flex-wrap: wrap }
+.dtc .code { font-weight: 700 }
+.dtc.active .code { color: var(--bad) }
+pre { font: .78rem var(--mono); background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 10px;
+  max-height: 260px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; margin: 0 }
+.note { border-left: 3px solid var(--warn); padding: 8px 10px; background: var(--bg); border-radius: 4px; font-size: .9rem }
+.note.bad { border-color: var(--bad) }
+details summary { cursor: pointer; font-weight: 600 }
+.small { font-size: .82rem; color: var(--muted) }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Ocean Scan</h1>
+    <p class="sub">Read-only scanner for the Fisker Ocean with a vLinker FD+. It never clears codes, resets modules or writes anything.</p>
+    <p class="small">Version 3 · 2026-11-20 · all read-only checks · results go to Claude automatically</p>
+  </header>
+
+  <div id="noBt" class="note bad" hidden>
+    This browser can't use Bluetooth. Open this page in <b>Chrome on Android</b> (iPhone browsers can't do this), loaded from an <b>https://</b> address.
+  </div>
+
+  <section aria-labelledby="h-conn">
+    <h2 id="h-conn">1 · Connect</h2>
+    <div class="row" style="margin-bottom:10px">
+      <div class="status"><span id="dot" class="dot"></span><span id="connText">Not connected</span></div>
+    </div>
+    <div class="row">
+      <button id="btnConnect" class="primary">Connect vLinker</button>
+      <button id="btnDisconnect" disabled>Disconnect</button>
+    </div>
+    <p class="small" style="margin-top:8px">Close Unfiskered GO first: the vLinker talks to one app at a time. Car in Park, not charging.</p>
+    <details style="margin-top:8px">
+      <summary>If it won't connect</summary>
+      <p class="small" style="margin:8px 0">The page looks for the usual adapter Bluetooth services. If yours uses a different one, paste its service ID here and connect again. "Show Bluetooth details" lists what the adapter offers.</p>
+      <label for="customSvc">Extra Bluetooth service ID (optional)
+        <input id="customSvc" placeholder="e.g. 0000fff0-0000-1000-8000-00805f9b34fb" autocomplete="off">
+      </label>
+    </details>
+  </section>
+
+  <section aria-labelledby="h-run">
+    <h2 id="h-run">2 · Run a check</h2>
+    <div class="row" style="margin-bottom:10px">
+      <label for="carState">What is the car doing right now?
+        <select id="carState">
+          <option>Just failed to enter Ready</option>
+          <option>In Ready, no sound</option>
+          <option>In Ready, sound working</option>
+          <option>Awake, not in Ready</option>
+          <option>Other (type in notes)</option>
+        </select>
+      </label>
+      <label for="notes">Notes (optional)
+        <input id="notes" placeholder="e.g. second try, brake pressed" autocomplete="off">
+      </label>
+    </div>
+    <h3>Scans</h3>
+    <div class="row">
+      <button id="btnFull" class="primary" disabled>Full scan (all 35 modules)</button>
+      <button id="btnSound" disabled>Sound + power modules only</button>
+      <button id="btnDetails" disabled>Fault details (freeze frames)</button>
+      <button id="btnStop" disabled>Stop</button>
+    </div>
+    <label style="margin-top:8px;flex-direction:row;display:flex;gap:8px;align-items:center" for="deepId"><input type="checkbox" id="deepId" style="width:auto"> Deep module ID in scans (boot software, supplier, programming date, last repair-shop code). Adds about a minute.</label>
+    <p class="small">Full scan reads part numbers, software versions and every fault code, including stored ones. Fault details then reads the conditions saved with each code it found (needs a scan first).</p>
+
+    <h3>Car readings</h3>
+    <div class="row">
+      <button id="btnCar" disabled>Car's own 12V + HV battery %</button>
+      <button id="btnVolts" disabled>Log 12V over time</button>
+      <button id="btnObd" disabled>Standard OBD check</button>
+      <button id="btnListen" disabled>30-second listen test</button>
+    </div>
+    <p class="small">Car's own 12V compares what the car thinks its 12V is with what the vLinker measures. A big gap points at the battery sensor (IBS). Listen test sends nothing.</p>
+
+    <h3>Advanced (read-only)</h3>
+    <div class="row">
+      <label for="advModule">Module
+        <select id="advModule"></select>
+      </label>
+      <label for="advDid">Data ID (hex)
+        <input id="advDid" value="F189" autocomplete="off" inputmode="text">
+      </label>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <button id="btnRead" disabled>Read once</button>
+      <button id="btnWatch" disabled>Watch every 10 s</button>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <label for="discFrom">Discovery: from (hex)
+        <input id="discFrom" value="F180" autocomplete="off">
+      </label>
+      <label for="discTo">to (hex)
+        <input id="discTo" value="F1FF" autocomplete="off">
+      </label>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <button id="btnDisc" disabled>Discover readable data on this module</button>
+    </div>
+    <p class="small">Discovery asks the chosen module for every data ID in the range, one at a time, and lists the ones it answers. Up to 1,024 IDs per run, about 4 per second. It stops by itself if the 12V drops below 11.8 V. Good ranges to try: F180–F1FF (identification), then 0100–01FF, DD00–DDFF, then wider.</p>
+  </section>
+
+  <section aria-labelledby="h-sum" id="summary">
+    <h2 id="h-sum">3 · Result</h2>
+    <div class="stats">
+      <div class="stat"><b id="sVolts">–</b><span>12V at OBD port</span></div>
+      <div class="stat"><b id="sAnswered">–</b><span>modules answered</span></div>
+      <div class="stat"><b id="sSilent">–</b><span>modules silent</span></div>
+      <div class="stat"><b id="sActive">–</b><span>active codes</span></div>
+      <div class="stat"><b id="sStored">–</b><span>stored codes</span></div>
+    </div>
+    <p id="progress" class="small" style="margin-top:10px">Example layout. Connect and run a check to fill this in.</p>
+    <div id="silentNote" class="note" style="margin-top:10px" hidden></div>
+    <div class="row" style="margin-top:12px">
+      <button id="btnShare" disabled>Share result</button>
+      <button id="btnSave" disabled>Save file</button>
+      <button id="btnCopy" disabled>Copy text</button>
+    </div>
+  </section>
+
+  <section aria-labelledby="h-extra" id="extraSec" hidden>
+    <h2 id="h-extra">Readings</h2>
+    <div id="extra"></div>
+  </section>
+
+  <section aria-labelledby="h-mods">
+    <h2 id="h-mods">Modules</h2>
+    <div id="mods"><p class="small">Nothing scanned yet.</p></div>
+  </section>
+
+  <section aria-labelledby="h-send">
+    <h2 id="h-send">Send results to Claude</h2>
+    <div class="row" style="margin-bottom:8px"><div class="status"><span id="sendDot" class="dot"></span><span id="sendText">Not set up yet</span></div></div>
+    <details id="sendSetup">
+      <summary>Set up once (paste your GitHub key)</summary>
+      <p class="small" style="margin:8px 0">Every result is saved automatically to your private GitHub repo, where Claude reads it. The key stays on this phone only. If you're offline, results wait and go up next time.</p>
+      <div class="row">
+        <label for="ghToken">GitHub key (fine-grained token)
+          <input id="ghToken" type="password" autocomplete="off" placeholder="github_pat_…">
+        </label>
+        <label for="ghRepo">Repo
+          <input id="ghRepo" value="mjb984/fisker-ocean-rea" autocomplete="off">
+        </label>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <button id="btnSaveKey">Save and test</button>
+        <button id="btnForget">Forget key</button>
+      </div>
+    </details>
+  </section>
+
+  <section aria-labelledby="h-log">
+    <details>
+      <summary id="h-log">Adapter log (for troubleshooting)</summary>
+      <div class="row" style="margin:8px 0"><button id="btnBtInfo" disabled>Show Bluetooth details</button></div>
+      <pre id="log" aria-live="polite"></pre>
+    </details>
+  </section>
+</main>
+
+<script>
+"use strict";
+// ---------------------------------------------------------------- module table
+// 11-bit CAN: request ID, response = request + 8. Addresses from the project's ECU map (docs/10).
+const MODULES = [
+  ["ACU",0x7A0],["AMP",0x7B5],["BCM",0x7C1],["BMS",0x7E1],["CIM",0x7D3],["CMRR_FL",0x794],["CMRR_FR",0x782],
+  ["CMRR_RL",0x796],["CMRR_RR",0x7A7],["DSCM",0x7A4],["ECC",0x7F0],["EPS",0x7E3],["EPS2",0x7F5],["ESP",0x7D0],
+  ["FCM",0x780],["GW",0x7B6],["ADAS",0x7A6],["ICC",0x7B1],["MCU_F",0x786],["MCU_R",0x7F2],["MRR",0x781],
+  ["OHC",0x783],["PDU",0x7F3],["PKC",0x7A2],["PLGM",0x7A3],["PSM",0x793],["PVIU",0x791],["PWC_L",0x785],
+  ["PWC_R",0x792],["RAC",0x787],["TBOX",0x7D1],["TRM",0x7C7],["VCU",0x7C2],["VSP",0x7C6],["iBooster",0x7F4]];
+const SOUND_POWER = ["AMP","VSP","RAC","ICC","GW","BCM","PDU","VCU","PKC"];
+const DESCR = {AMP:"amplifier",VSP:"likely pedestrian sound",RAC:"role unconfirmed",ICC:"center screen",
+  GW:"gateway",BCM:"body controller",PDU:"DC-DC / 12V charging",VCU:"vehicle controller",PKC:"keys",PVIU:"SolarSky converter (likely)",
+  BMS:"HV battery",TBOX:"cellular modem"};
+const VERSION_DIDS = [[0xF187,"part number"],[0xF189,"software"],[0xF191,"hardware number"],[0xF193,"supplier hardware"],[0xF195,"supplier software"]];
+const VIN_DID = 0xF190;
+const DEEP_DIDS = [[0xF180,"boot software"],[0xF18A,"supplier ID"],[0xF18B,"manufacture date"],[0xF197,"system name"],[0xF198,"repair shop code"],[0xF199,"programming date"],[0xF19D,"install date"]];
+const PRIVATE_DIDS = new Set([0xF190, 0xF18C]); // VIN, ECU serial number: shown redacted
+const NRC = {0x10:"general reject",0x11:"service not supported",0x12:"sub-function not supported",0x13:"wrong length",
+  0x22:"conditions not correct",0x31:"not available",0x33:"security denied",0x7E:"not in this session",0x7F:"not in this session"};
+const STATUS_BITS = [[0x01,"failing now"],[0x02,"failed this cycle"],[0x04,"pending"],[0x08,"stored"],
+  [0x10,"not tested since clear"],[0x20,"failed since clear"],[0x40,"not tested this cycle"],[0x80,"warning light"]];
+
+// ---------------------------------------------------------------- safety guards
+const ALLOWED_AT = /^(Z|WS|D|I|@1|RV|E0|L0|S0|H1|SP6|CAF1|AT1|ST[0-9A-F]{2}|SH[0-9A-F]{3}|CRA[0-9A-F]{3}|AR|CSM1|MA)$/;
+function guardAt(c){ if(!ALLOWED_AT.test(c.toUpperCase())) throw new Error("Safety stop: AT"+c+" is not on the read-only list"); }
+function guardUds(p){
+  if(p.length>=3 && p[0]===0x22 && (p.length-1)%2===0) return;          // read data by ID
+  if(p[0]===0x19){                                                      // read fault info, sub-functions that only read
+    if((p[1]===0x01||p[1]===0x02) && p.length===3) return;              // count / list by status
+    if((p[1]===0x04||p[1]===0x06) && p.length===6) return;              // freeze frame / extended data for one code
+    if(p[1]===0x0A && p.length===2) return;                             // all supported codes
+  }
+  if((p[0]===0x01||p[0]===0x09) && p.length===2) return;               // standard OBD current data / vehicle info
+  throw new Error("Safety stop: request "+hex(p)+" refused (only reads are allowed)");
+}
+
+// ---------------------------------------------------------------- helpers
+const $ = id => document.getElementById(id);
+const hex = b => Array.from(b,x=>x.toString(16).padStart(2,"0")).join(" ").toUpperCase();
+const sleep = ms => new Promise(r=>setTimeout(r,ms));
+function asciiOrHex(b){
+  let end=b.length; while(end>0 && (b[end-1]===0||b[end-1]===0xFF||b[end-1]===0x20)) end--;
+  const s=b.slice(0,end);
+  if(s.length && s.every(c=>c>=32&&c<127)) return String.fromCharCode(...s);
+  return hex(b);
+}
+const redactVin = v => v ? v.slice(0,3)+"*".repeat(Math.max(0,v.length-3)) : v;
+function dtcCode(b0,b1,b2){ return "PCBU"[b0>>6]+((b0>>4)&3)+(b0&0xF).toString(16).toUpperCase()+b1.toString(16).padStart(2,"0").toUpperCase()+b2.toString(16).padStart(2,"0").toUpperCase(); }
+function decodeDtcs(r){
+  const out=[]; const body=r.slice(3);
+  for(let i=0;i+3<body.length;i+=4){
+    const [b0,b1,b2,st]=body.slice(i,i+4);
+    out.push({code:dtcCode(b0,b1,b2),status_hex:st.toString(16).padStart(2,"0").toUpperCase(),
+      status:STATUS_BITS.filter(([bit])=>st&bit).map(([,n])=>n),active:!!(st&1)});
+  }
+  return out;
+}
+const describeNeg = r => "refused: "+(NRC[r[2]]||"code")+" (0x"+(r[2]||0).toString(16).padStart(2,"0").toUpperCase()+")";
+
+function parseIsotp(lines, rxId){
+  const msgs=[]; let data=[], expected=null;
+  for(let l of lines){
+    l=l.replace(/\s/g,"").toUpperCase();
+    if(!/^[0-9A-F]+$/.test(l) || l.length<5 || parseInt(l.slice(0,3),16)!==rxId) continue;
+    const h=l.slice(3); const f=[]; for(let i=0;i+1<h.length;i+=2) f.push(parseInt(h.slice(i,i+2),16));
+    if(!f.length) continue;
+    const kind=f[0]>>4;
+    if(kind===0){ msgs.push(f.slice(1,1+(f[0]&0xF))); expected=null; }
+    else if(kind===1){ expected=((f[0]&0xF)<<8)|f[1]; data=f.slice(2); }
+    else if(kind===2 && expected!==null){ data=data.concat(f.slice(1)); }
+    if(expected!==null && data.length>=expected){ msgs.push(data.slice(0,expected)); expected=null; }
+  }
+  if(expected!==null && data.length) msgs.push(data);
+  return msgs;
+}
+function pickResponse(msgs){
+  for(let i=msgs.length-1;i>=0;i--){ const m=msgs[i]; if(!(m.length>=3&&m[0]===0x7F&&m[2]===0x78)) return m; }
+  return msgs.length?msgs[msgs.length-1]:null;
+}
+
+// ---------------------------------------------------------------- log
+const logLines=[];
+function log(s){ logLines.push(s); if(logLines.length>800) logLines.shift(); const el=$("log"); el.textContent=logLines.join("\n"); el.scrollTop=el.scrollHeight; }
+
+// ---------------------------------------------------------------- BLE transport
+const CANDIDATE_SERVICES = [
+  "0000fff0-0000-1000-8000-00805f9b34fb", "0000ffe0-0000-1000-8000-00805f9b34fb",
+  "000018f0-0000-1000-8000-00805f9b34fb", "0000ffe5-0000-1000-8000-00805f9b34fb",
+  "e7810a71-73ae-499d-8c15-faa9aef0c3f2", "49535343-fe7d-4ae5-8fa9-9fafd205e455",
+  "0000fee7-0000-1000-8000-00805f9b34fb"];
+const BT = { device:null, server:null, writeChar:null, notifyChar:null, noResp:true, services:[] };
+let rxBuf="";
+let rxWaiters=[];
+function onRx(text){ rxBuf+=text; const w=rxWaiters; rxWaiters=[]; w.forEach(f=>f()); }
+function waitRx(ms){ return new Promise(res=>{ const t=setTimeout(()=>{ rxWaiters=rxWaiters.filter(f=>f!==g); res(); },ms); const g=()=>{clearTimeout(t);res();}; rxWaiters.push(g); }); }
+
+async function btConnect(){
+  const extra=$("customSvc").value.trim().toLowerCase();
+  const optionalServices=[...CANDIDATE_SERVICES]; if(extra) optionalServices.push(extra);
+  BT.device = await navigator.bluetooth.requestDevice({acceptAllDevices:true, optionalServices});
+  BT.device.addEventListener("gattserverdisconnected", ()=>{ setConn("err","Disconnected"); enable(false); });
+  setConn("busy","Connecting to "+(BT.device.name||"adapter")+"…");
+  BT.server = await BT.device.gatt.connect();
+  const services = await BT.server.getPrimaryServices();
+  BT.services=[];
+  for(const s of services){
+    const chars = await s.getCharacteristics();
+    BT.services.push({uuid:s.uuid, chars:chars.map(c=>({uuid:c.uuid, props:Object.keys(propsOf(c)).filter(k=>propsOf(c)[k])}))});
+    const notify = chars.find(c=>c.properties.notify||c.properties.indicate);
+    const write = chars.find(c=>c.properties.writeWithoutResponse) || chars.find(c=>c.properties.write);
+    if(notify && write && !BT.writeChar){ BT.notifyChar=notify; BT.writeChar=write; BT.noResp=!!write.properties.writeWithoutResponse; log("[bt] service "+s.uuid+" write "+write.uuid+" notify "+notify.uuid); }
+  }
+  if(!BT.writeChar) throw new Error("Connected, but no adapter serial service found. Open 'Show Bluetooth details' and send me what it lists.");
+  const dec = new TextDecoder();
+  BT.notifyChar.addEventListener("characteristicvaluechanged", e=>onRx(dec.decode(e.target.value)));
+  await BT.notifyChar.startNotifications();
+}
+function propsOf(c){ const p=c.properties; return {read:p.read,write:p.write,writeWithoutResponse:p.writeWithoutResponse,notify:p.notify,indicate:p.indicate}; }
+async function btWrite(str){
+  const enc=new TextEncoder().encode(str);
+  for(let i=0;i<enc.length;i+=20){
+    const chunk=enc.slice(i,i+20);
+    if(BT.noResp && BT.writeChar.writeValueWithoutResponse) await BT.writeChar.writeValueWithoutResponse(chunk);
+    else if(BT.writeChar.writeValueWithResponse) await BT.writeChar.writeValueWithResponse(chunk);
+    else await BT.writeChar.writeValue(chunk);
+  }
+}
+
+// ---------------------------------------------------------------- ELM session
+const ELM = { header:null, busy:false };
+async function readPrompt(ms){
+  const end=Date.now()+ms;
+  while(rxBuf.indexOf(">")<0){ const left=end-Date.now(); if(left<=0) throw new Error("Adapter did not answer"); await waitRx(left); }
+  const i=rxBuf.indexOf(">"); const text=rxBuf.slice(0,i); rxBuf=rxBuf.slice(i+1); return text;
+}
+async function raw(line, ms=5000){
+  log(">> "+line);
+  await btWrite(line+"\r");
+  const text=await readPrompt(ms);
+  const lines=text.split(/[\r\n]+/).map(s=>s.trim()).filter(s=>s && s.toUpperCase()!==line.toUpperCase());
+  lines.forEach(l=>log("<< "+l));
+  return lines;
+}
+async function at(c, ms){ guardAt(c); return raw("AT"+c, ms); }
+async function elmInit(){
+  rxBuf=""; await btWrite("\r"); await sleep(300); rxBuf="";
+  const id=await at("Z",8000);
+  for(const c of ["E0","L0","S0","H1","SP6","CAF1","AT1","ST32"]) await at(c);
+  ELM.header=null; return id.join(" ");
+}
+async function setTarget(tx){
+  if(ELM.header===tx) return;
+  await at("SH"+tx.toString(16).toUpperCase().padStart(3,"0"));
+  await at("CRA"+(tx+8).toString(16).toUpperCase().padStart(3,"0"));
+  ELM.header=tx;
+}
+async function uds(tx, payload, ms=3000){
+  guardUds(payload);
+  await setTarget(tx); await sleep(150);
+  const line=hex(payload).replace(/ /g,"");
+  let r=pickResponse(parseIsotp(await raw(line,ms),tx+8));
+  for(let n=0; r && r.length>=3 && r[0]===0x7F && r[2]===0x78 && n<3; n++){ await sleep(1000); r=pickResponse(parseIsotp(await raw(line,ms+2000),tx+8)); }
+  return r;
+}
+async function adapterVolts(){
+  for(const l of await at("RV")){ const m=l.toUpperCase().match(/(\d+(?:\.\d+)?)\s*V/); if(m) return parseFloat(m[1]); }
+  return null;
+}
+
+// ---------------------------------------------------------------- UI state
+let stopFlag=false, report=null, lastScan=null;
+const ACTION_BTNS=["btnFull","btnSound","btnListen","btnVolts","btnCar","btnObd","btnRead","btnWatch","btnDisc"];
+function hasCodes(){ return !!lastScan && Object.values(lastScan.modules).some(m=>Array.isArray(m.dtcs)&&m.dtcs.length); }
+function setConn(kind,text){ $("dot").className="dot "+(kind||""); $("connText").textContent=text; }
+function enable(on){
+  ACTION_BTNS.concat(["btnBtInfo"]).forEach(id=>$(id).disabled=!on); $("btnDetails").disabled=!on || !hasCodes();
+  $("btnDisconnect").disabled=!on; $("btnConnect").disabled=on;
+}
+function running(on){
+  ELM.busy=on; ACTION_BTNS.concat(["btnDisconnect"]).forEach(id=>$(id).disabled=on); $("btnDetails").disabled=on||!hasCodes(); $("btnStop").disabled=!on;
+}
+function esc(s){ return String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+
+function renderModules(){
+  if(!report || !report.modules) return;
+  const html=Object.entries(report.modules).map(([name,e])=>{
+    let pill;
+    if(e.answered===undefined) pill='<span class="pill warn">checking…</span>';
+    else if(!e.answered) pill='<span class="pill off">silent</span>';
+    else if(Array.isArray(e.dtcs) && e.dtcs.some(d=>d.active)) pill='<span class="pill bad">active fault</span>';
+    else if(Array.isArray(e.dtcs) && e.dtcs.length) pill='<span class="pill warn">stored codes</span>';
+    else pill='<span class="pill ok">ok</span>';
+    let body="";
+    if(e.versions){ const v=Object.entries(e.versions).filter(([,x])=>x!==null && !String(x).startsWith("refused")).map(([k,x])=>esc(k)+": "+esc(x)).join(" · "); if(v) body+='<div class="kv">'+v+'</div>'; }
+    if(e.deep_id){ const v=Object.entries(e.deep_id).filter(([,x])=>x!==null && !String(x).startsWith("refused")).map(([k,x])=>esc(k)+": "+esc(x)).join(" · "); if(v) body+='<div class="kv">'+v+'</div>'; }
+    if(e.vin) body+='<div class="kv">VIN: '+esc(e.vin)+'</div>';
+    if(Array.isArray(e.dtcs)) body+= e.dtcs.length ? e.dtcs.map(d=>'<div class="dtc'+(d.active?' active':'')+'"><span class="code">'+d.code+'</span><span class="small">'+esc(d.status.join(", "))+'</span></div>'+(d.details?'<div class="kv">freeze frame: '+esc(d.details.snapshot)+'<br>extended data: '+esc(d.details.extended)+'</div>':"")).join("") : (e.answered?'<div class="small">No fault codes</div>':"");
+    else if(typeof e.dtcs==="string") body+='<div class="small">Codes: '+esc(e.dtcs)+'</div>';
+    if(e.error) body+='<div class="small">'+esc(e.error)+'</div>';
+    return '<div class="mod"><div class="mod-head"><div><span class="mod-name">'+name+'</span> <span class="small">'+esc(DESCR[name]||"")+'</span> <span class="mod-addr">'+e.request_id+'</span></div>'+pill+'</div>'+body+'</div>';
+  }).join("");
+  $("mods").innerHTML=html||'<p class="small">Nothing scanned yet.</p>';
+}
+function renderSummary(){
+  if(!report) return;
+  const mods=Object.values(report.modules||{});
+  const done=mods.filter(m=>m.answered!==undefined);
+  const silent=Object.entries(report.modules||{}).filter(([,m])=>m.answered===false).map(([n])=>n);
+  let act=0,sto=0; mods.forEach(m=>{ if(Array.isArray(m.dtcs)) m.dtcs.forEach(d=>d.active?act++:sto++); });
+  $("sVolts").textContent = report.adapter_volts_end ?? report.adapter_volts_start ?? "–";
+  if(typeof report.adapter_volts_start==="number") $("sVolts").textContent = (report.adapter_volts_end ?? report.adapter_volts_start).toFixed(1)+" V";
+  $("sAnswered").textContent=done.length?(done.length-silent.length)+"/"+done.length:"–";
+  $("sSilent").textContent=done.length?silent.length:"–";
+  $("sActive").textContent=done.length?act:"–"; $("sStored").textContent=done.length?sto:"–";
+  report.silent_modules=silent;
+  const n=$("silentNote");
+  if(silent.length){ n.hidden=false; n.textContent="Silent modules: "+silent.join(", ")+". A module that doesn't answer is a clue in itself (asleep, no power, or off the network)."; }
+  else n.hidden=true;
+}
+
+// ---------------------------------------------------------------- actions
+function newReport(kind){
+  return { tool:"Ocean Scan (web)", kind, time:new Date().toISOString(), car_state:$("carState").value,
+    notes:$("notes").value, adapter:null, adapter_volts_start:null, adapter_volts_end:null, modules:{} };
+}
+async function runScan(names){
+  running(true); stopFlag=false;
+  report=newReport(names.length===MODULES.length?"full scan":"sound + power scan");
+  const list=MODULES.filter(([n])=>names.includes(n));
+  list.forEach(([n,tx])=>report.modules[n]={request_id:"0x"+tx.toString(16).toUpperCase(),response_id:"0x"+(tx+8).toString(16).toUpperCase()});
+  renderModules();
+  try{
+    report.adapter=await elmInit();
+    report.adapter_volts_start=await adapterVolts(); renderSummary();
+    let i=0;
+    for(const [name,tx] of list){
+      if(stopFlag) break;
+      i++; $("progress").textContent="Reading "+name+" ("+i+" of "+list.length+")…";
+      const e=report.modules[name];
+      try{
+        if(name==="GW"||name==="VCU"){ const r=await uds(tx,[0x22,VIN_DID>>8,VIN_DID&0xFF]); if(r&&r[0]===0x62) e.vin=redactVin(asciiOrHex(r.slice(3))); }
+        e.versions={};
+        for(const [did,label] of VERSION_DIDS){
+          if(stopFlag) break;
+          const r=await uds(tx,[0x22,did>>8,did&0xFF]);
+          e.versions[label]= r===null?null : r[0]===0x62?asciiOrHex(r.slice(3)) : r[0]===0x7F?describeNeg(r) : "unexpected "+hex(r);
+          if(r===null && label==="part number") break; // silent module: don't keep knocking
+        }
+        if($("deepId").checked && Object.values(e.versions).some(v=>v!==null)){
+          e.deep_id={};
+          for(const [did,label] of DEEP_DIDS){ if(stopFlag) break; const r=await uds(tx,[0x22,did>>8,did&0xFF]); e.deep_id[label]= r===null?null : r[0]===0x62?showDid(did,r) : r[0]===0x7F?describeNeg(r):hex(r); }
+        }
+        const r=await uds(tx,[0x19,0x02,0xFF],4000);
+        if(r===null) e.dtcs=null; else if(r[0]===0x59) e.dtcs=decodeDtcs(r); else e.dtcs= r[0]===0x7F?describeNeg(r):hex(r);
+        e.answered = Object.values(e.versions).some(v=>v!==null) || e.dtcs!==null;
+      }catch(err){
+        e.error=String(err.message||err); e.answered=false; log("!! "+e.error);
+        if(String(err.message).startsWith("Safety")) throw err;
+        try{ await elmInit(); }catch(_){}
+      }
+      renderModules(); renderSummary();
+    }
+    report.adapter_volts_end=await adapterVolts();
+    $("progress").textContent=(stopFlag?"Stopped. ":"Done. ")+"Use Share or Save to send me the result. The VIN is hidden."+(hasCodesIn(report)?" Fault details is now available.":"");
+    lastScan=report;
+  }catch(err){ $("progress").textContent="Stopped: "+(err.message||err); log("!! "+(err.message||err)); }
+  renderSummary(); renderModules(); running(false); exportsOn(true);
+}
+async function runListen(){
+  running(true); stopFlag=false;
+  report=newReport("listen test"); report.modules={};
+  try{
+    report.adapter=await elmInit(); report.adapter_volts_start=await adapterVolts();
+    await at("AR"); await at("CSM1"); guardAt("MA");
+    rxBuf=""; log(">> ATMA (silent listen, 30 s)");
+    $("progress").textContent="Listening silently for 30 seconds. Nothing is sent to the car.";
+    await btWrite("ATMA\r");
+    const end=Date.now()+30000; while(Date.now()<end && !stopFlag) await waitRx(500);
+    await btWrite("\r"); await sleep(600);
+    const text=rxBuf; rxBuf="";
+    const frames=text.split(/[\r\n>]+/).map(s=>s.trim().replace(/\s/g,"")).filter(s=>/^[0-9A-F]{3,}$/.test(s));
+    const ids={}; frames.forEach(f=>ids[f.slice(0,3)]=(ids[f.slice(0,3)]||0)+1);
+    report.listen={seconds:30, frames:frames.length, distinct_ids:Object.keys(ids).length, ids, buffer_full:/BUFFER FULL/i.test(text), raw:text.slice(0,20000)};
+    $("progress").textContent = frames.length
+      ? "Heard "+frames.length+" messages from "+Object.keys(ids).length+" senders. The OBD port carries broadcast traffic."
+      : "Heard nothing. The gateway keeps internal traffic off the OBD port, so a live dashboard would need a tap inside the car later.";
+    log("[listen] frames "+frames.length+", IDs "+Object.keys(ids).join(" "));
+    await elmInit();
+    report.adapter_volts_end=await adapterVolts();
+  }catch(err){ $("progress").textContent="Stopped: "+(err.message||err); }
+  renderSummary(); running(false); exportsOn(true);
+}
+async function runVolts(){
+  running(true); stopFlag=false;
+  report=newReport("12V log"); report.modules={}; report.volts=[];
+  try{
+    report.adapter=await elmInit();
+    while(!stopFlag){
+      const v=await adapterVolts(); const t=new Date().toISOString();
+      report.volts.push({time:t,volts:v}); report.adapter_volts_end=v; if(report.adapter_volts_start===null) report.adapter_volts_start=v;
+      renderSummary();
+      $("progress").textContent="12V: "+v+" V at "+new Date().toLocaleTimeString()+" ("+report.volts.length+" readings, every 10 s). Press Stop when done."+(v!==null&&v<12.2?" Below 12.2 V.":"");
+      for(let i=0;i<20 && !stopFlag;i++) await sleep(500);
+    }
+  }catch(err){ $("progress").textContent="Stopped: "+(err.message||err); }
+  running(false); exportsOn(true);
+}
+
+function hasCodesIn(r){ return !!r && Object.values(r.modules||{}).some(m=>Array.isArray(m.dtcs)&&m.dtcs.length); }
+function moduleTx(name){ const m=MODULES.find(x=>x[0]===name); return m?m[1]:null; }
+function parseDid(v){ const t=String(v).trim().replace(/^0x/i,""); if(!/^[0-9A-Fa-f]{1,4}$/.test(t)) throw new Error("Data ID must be 1 to 4 hex digits, e.g. F189"); return parseInt(t,16); }
+function showDid(did, r){
+  if(r===null) return "no answer";
+  if(r[0]===0x7F) return describeNeg(r);
+  if(r[0]!==0x62) return "unexpected "+hex(r);
+  const v=r.slice(3);
+  if(PRIVATE_DIDS.has(did)) return redactVin(asciiOrHex(v))+" (hidden)";
+  const a=asciiOrHex(v); return a===hex(v) ? "["+a+"]" : (v.length>=3 ? a+"  ["+hex(v)+"]" : "["+hex(v)+"]");
+}
+function numberGuesses(v){
+  if(!v.length||v.length>2) return "";
+  let n=0; v.forEach(b=>n=n*256+b);
+  return "as a number: "+n+" (if mV: "+(n/1000).toFixed(2)+" V; if 0.1 units: "+(n/10).toFixed(1)+"; if 0.01: "+(n/100).toFixed(2)+")";
+}
+function showExtra(title, rows){
+  $("extraSec").hidden=false;
+  const html='<div class="mod"><div class="mod-head"><span class="mod-name">'+esc(title)+'</span><span class="small">'+new Date().toLocaleTimeString()+'</span></div>'+rows.map(r=>'<div class="kv">'+esc(r)+'</div>').join("")+'</div>';
+  $("extra").insertAdjacentHTML("afterbegin", html);
+}
+async function begin(kind){ running(true); stopFlag=false; report=newReport(kind); report.modules={}; await elmInit(); report.adapter_volts_start=await adapterVolts(); renderSummary(); }
+async function finish(msg){ try{ report.adapter_volts_end=await adapterVolts(); }catch(_){} renderSummary(); if(msg) $("progress").textContent=msg; running(false); exportsOn(true); }
+
+// Car's own 12V reading (DID EFF9, noted in docs/10) and HV battery % (BMS DID 2050). Scaling unconfirmed: raw shown.
+async function runCar(){
+  try{
+    await begin("car readings"); report.car_readings={};
+    const rows=["vLinker measures: "+report.adapter_volts_start+" V at the OBD port"];
+    for(const [mod,did,label] of [["VCU",0xEFF9,"12V (car)"],["BCM",0xEFF9,"12V (car)"],["PKC",0xEFF9,"12V (car)"],["BMS",0x2050,"HV battery %"]]){
+      if(stopFlag) break;
+      const r=await uds(moduleTx(mod),[0x22,did>>8,did&0xFF]);
+      const raw = r&&r[0]===0x62 ? r.slice(3) : null;
+      report.car_readings[mod+" "+did.toString(16).toUpperCase()]={label, raw: raw?hex(raw):null, answer: showDid(did,r)};
+      rows.push(mod+" "+label+": "+showDid(did,r)+(raw?"  "+numberGuesses(raw):""));
+    }
+    rows.push("The unit of these values isn't confirmed yet. Send this and I'll match it against your multimeter and battery monitor.");
+    showExtra("Car's own readings", rows);
+    await finish("Car readings done.");
+  }catch(err){ await finish("Stopped: "+(err.message||err)); }
+}
+
+// Fault details: freeze frame (19 04) and extended data (19 06) for each code found by the last scan.
+async function runDetails(){
+  if(!lastScan) return;
+  running(true); stopFlag=false;
+  try{
+    await elmInit();
+    let n=0;
+    for(const [name,e] of Object.entries(lastScan.modules)){
+      if(!Array.isArray(e.dtcs)) continue;
+      const tx=moduleTx(name);
+      for(const d of e.dtcs){
+        if(stopFlag) break;
+        n++; $("progress").textContent="Reading details for "+name+" "+d.code+"…";
+        const b=dtcBytes(d.code);
+        const snap=await uds(tx,[0x19,0x04,...b,0xFF],4000);
+        const ext=await uds(tx,[0x19,0x06,...b,0xFF],4000);
+        d.details={snapshot: snap===null?"no answer": snap[0]===0x59?hex(snap.slice(2)): snap[0]===0x7F?describeNeg(snap):hex(snap),
+                   extended: ext===null?"no answer": ext[0]===0x59?hex(ext.slice(2)): ext[0]===0x7F?describeNeg(ext):hex(ext)};
+      }
+    }
+    report=lastScan; renderModules(); renderSummary();
+    $("progress").textContent="Fault details read for "+n+" codes (raw data; I'll decode them). Share or Save to send.";
+  }catch(err){ $("progress").textContent="Stopped: "+(err.message||err); }
+  running(false); exportsOn(true);
+}
+function dtcBytes(code){
+  const L="PCBU".indexOf(code[0]); const d1=parseInt(code[1],10), n=parseInt(code[2],16);
+  return [(L<<6)|(d1<<4)|n, parseInt(code.slice(3,5),16), parseInt(code.slice(5,7),16)];
+}
+
+// Standard OBD-II check, sent to all modules at once (functional address 7DF). Read-only.
+async function runObd(){
+  try{
+    await begin("standard OBD check");
+    await at("SH7DF"); await at("AR"); ELM.header=null;
+    const rows=[]; report.obd={};
+    for(const [req,label] of [[[0x01,0x00],"current data PIDs supported"],[[0x09,0x00],"vehicle info supported"],[[0x01,0x01],"monitor status"]]){
+      guardUds(req); await sleep(150);
+      const lines=await raw(hex(req).replace(/ /g,""),4000);
+      const answers=[];
+      for(let id=0x7E8; id<=0x7EF; id++){ const m=parseIsotp(lines,id); if(m.length) answers.push(id.toString(16).toUpperCase()+": "+hex(m[0])); }
+      for(const l of lines){ const t=l.replace(/\s/g,""); if(/^[0-9A-F]{3}/.test(t)){ const id=parseInt(t.slice(0,3),16); if((id<0x7E8||id>0x7EF)) { const m=parseIsotp(lines,id); if(m.length && !answers.some(a=>a.startsWith(id.toString(16).toUpperCase()))) answers.push(id.toString(16).toUpperCase()+": "+hex(m[0])); } } }
+      report.obd[label]=answers.length?answers:"no module answered";
+      rows.push(label+": "+(answers.length?answers.join(" | "):"no module answered"));
+    }
+    rows.push("Electric cars often skip standard OBD data. 'No module answered' is a normal result.");
+    showExtra("Standard OBD check", rows);
+    await elmInit();
+    await finish("Standard OBD check done.");
+  }catch(err){ await finish("Stopped: "+(err.message||err)); }
+}
+
+// Single read and watch.
+async function runRead(watch){
+  try{
+    const name=$("advModule").value, tx=moduleTx(name), did=parseDid($("advDid").value);
+    await begin(watch?"watch "+name+" "+did.toString(16).toUpperCase():"read "+name+" "+did.toString(16).toUpperCase());
+    report.reads=[];
+    do{
+      const r=await uds(tx,[0x22,did>>8,did&0xFF]);
+      const raw=r&&r[0]===0x62&&!PRIVATE_DIDS.has(did)?r.slice(3):null;
+      const line=showDid(did,r)+(raw?"  "+numberGuesses(raw):"");
+      report.reads.push({time:new Date().toISOString(), module:name, did:did.toString(16).toUpperCase(), value:line});
+      showExtra(name+" "+did.toString(16).toUpperCase().padStart(4,"0"), [line]);
+      if(watch){ $("progress").textContent="Watching "+name+" "+did.toString(16).toUpperCase()+" every 10 s ("+report.reads.length+" readings). Press Stop when done.";
+        for(let i=0;i<20&&!stopFlag;i++) await sleep(500); }
+    } while(watch && !stopFlag);
+    await finish(watch?"Watch stopped.":"Read done.");
+  }catch(err){ await finish("Stopped: "+(err.message||err)); }
+}
+
+// Slow read-only discovery of data IDs on one module.
+async function runDiscover(){
+  try{
+    const name=$("advModule").value, tx=moduleTx(name);
+    const from=parseDid($("discFrom").value), to=parseDid($("discTo").value);
+    if(to<from) throw new Error("'to' must be after 'from'");
+    if(to-from+1>1024) throw new Error("Range too big: keep it to 1,024 IDs or fewer per run");
+    await begin("discovery "+name+" "+from.toString(16).toUpperCase()+"-"+to.toString(16).toUpperCase());
+    const found=[]; report.discovery={module:name, from:from.toString(16).toUpperCase(), to:to.toString(16).toUpperCase(), found};
+    let silentRun=0;
+    for(let did=from; did<=to && !stopFlag; did++){
+      if((did-from)%50===0){ const v=await adapterVolts(); report.adapter_volts_end=v; renderSummary();
+        if(v!==null && v<11.8){ $("progress").textContent="Stopped: 12V dropped to "+v+" V."; break; } }
+      $("progress").textContent="Discovery on "+name+": "+did.toString(16).toUpperCase().padStart(4,"0")+" ("+(did-from+1)+" of "+(to-from+1)+"), found "+found.length+"…";
+      const r=await uds(tx,[0x22,did>>8,did&0xFF],1500);
+      if(r===null){ if(++silentRun>=10){ $("progress").textContent="Stopped: the module stopped answering."; break; } continue; }
+      silentRun=0;
+      if(r[0]===0x62){ const v=r.slice(3); found.push({did:did.toString(16).toUpperCase().padStart(4,"0"), value: PRIVATE_DIDS.has(did)?"(hidden)":showDid(did,r)}); }
+      else if(r[0]===0x7F && r[2]!==0x31){ found.push({did:did.toString(16).toUpperCase().padStart(4,"0"), value:describeNeg(r)}); }
+    }
+    showExtra("Discovery on "+name+" ("+found.length+" found)", found.length?found.map(f=>f.did+": "+f.value):["Nothing readable in this range."]);
+    await finish("Discovery finished: "+found.length+" data IDs answered. Share or Save to send.");
+  }catch(err){ await finish("Stopped: "+(err.message||err)); }
+}
+
+// ---------------------------------------------------------------- export
+function exportsOn(on){ ["btnShare","btnSave","btnCopy"].forEach(id=>$(id).disabled=!on); if(on && report) queueUpload(report); }
+
+// ---------------------------------------------------------------- automatic upload to the private GitHub repo
+const LS={get(k){ try{ return localStorage.getItem(k); }catch(_){ return null; } }, set(k,v){ try{ localStorage.setItem(k,v); }catch(_){} }, del(k){ try{ localStorage.removeItem(k); }catch(_){} }};
+function ghCfg(){ return { token: LS.get("os.ghToken"), repo: LS.get("os.ghRepo") || "mjb984/fisker-ocean-rea" }; }
+function setSend(kind,text){ $("sendDot").className="dot "+(kind||""); $("sendText").textContent=text; }
+function b64utf8(str){ const bytes=new TextEncoder().encode(str); let bin=""; for(let i=0;i<bytes.length;i+=0x8000) bin+=String.fromCharCode(...bytes.subarray(i,i+0x8000)); return btoa(bin); }
+function scanPath(r){ const t=(r.time||new Date().toISOString()); return "scans/"+t.slice(0,10)+"/"+t.slice(11,19).replace(/:/g,"")+"-"+(r.kind||"scan").replace(/\W+/g,"-")+".json"; }
+let uploadedTimes=new Set();
+function loadQueue(){ try{ return JSON.parse(LS.get("os.queue")||"[]"); }catch(_){ return []; } }
+function saveQueue(q){ LS.set("os.queue", JSON.stringify(q.slice(-30))); }
+function queueUpload(r){
+  if(uploadedTimes.has(r.time+r.kind+(r.reads?r.reads.length:"")+(r.volts?r.volts.length:""))) return;
+  const q=loadQueue(); q.push({path:scanPath(r), body:JSON.stringify(r,null,2)}); saveQueue(q);
+  uploadedTimes.add(r.time+r.kind+(r.reads?r.reads.length:"")+(r.volts?r.volts.length:""));
+  flushQueue();
+}
+async function ghPut(cfg, path, content, message){
+  const url="https://api.github.com/repos/"+cfg.repo+"/contents/"+path.split("/").map(encodeURIComponent).join("/");
+  const headers={"Authorization":"Bearer "+cfg.token,"Accept":"application/vnd.github+json","X-GitHub-Api-Version":"2022-11-28"};
+  let sha;
+  const head=await fetch(url,{headers}); if(head.ok){ sha=(await head.json()).sha; }
+  const res=await fetch(url,{method:"PUT",headers:Object.assign({"Content-Type":"application/json"},headers),
+    body:JSON.stringify({message, content:b64utf8(content), sha})});
+  if(!res.ok){ const t=await res.text(); throw new Error("GitHub said "+res.status+(res.status===404?" (repo name or key access wrong)":res.status===401?" (key not valid)":res.status===403?" (key can't write to this repo)":"")+" "+t.slice(0,120)); }
+}
+let flushing=false;
+async function flushQueue(){
+  const cfg=ghCfg();
+  const q=loadQueue();
+  if(!cfg.token){ if(q.length) setSend("busy", q.length+" result(s) waiting. Set up the key below to send them."); return; }
+  if(flushing||!q.length) return; flushing=true;
+  try{
+    while(true){
+      const cur=loadQueue(); if(!cur.length) break;
+      const item=cur[0]; setSend("busy","Sending "+item.path.split("/").pop()+"…");
+      await ghPut(cfg, item.path, item.body, "Ocean Scan result "+item.path.split("/").pop());
+      saveQueue(loadQueue().slice(1));
+      setSend("on","Sent to Claude: "+item.path.split("/").pop()+" at "+new Date().toLocaleTimeString());
+    }
+  }catch(err){ const m=String(err.message||err); setSend("err", /fetch|network/i.test(m) ? "Couldn't reach GitHub (no signal?). "+loadQueue().length+" result(s) will be sent automatically later." : m); }
+  flushing=false;
+}
+window.addEventListener("online", flushQueue);
+setInterval(()=>{ if(loadQueue().length) flushQueue(); }, 60000);
+$("btnSaveKey").onclick=async()=>{
+  const token=$("ghToken").value.trim(), repo=$("ghRepo").value.trim();
+  if(token) LS.set("os.ghToken",token); if(repo) LS.set("os.ghRepo",repo);
+  $("ghToken").value="";
+  try{
+    setSend("busy","Testing…");
+    await ghPut(ghCfg(),"scans/_connection-test.json",JSON.stringify({ok:true,time:new Date().toISOString(),app:"Ocean Scan v3"},null,2),"Ocean Scan connection test");
+    setSend("on","Connected to "+ghCfg().repo+". Results will be sent automatically."); $("sendSetup").open=false; flushQueue();
+  }catch(err){ setSend("err",String(err.message||err)); }
+};
+$("btnForget").onclick=()=>{ LS.del("os.ghToken"); setSend("","Key removed from this phone."); };
+(function initSend(){ const c=ghCfg(); if(c.token){ setSend("on","Ready: results go to "+c.repo+" automatically."); flushQueue(); } else { $("sendSetup").open=true; } })();
+function fileName(){ return "ocean-"+(report.kind||"scan").replace(/\W+/g,"-")+"-"+report.time.slice(0,16).replace(/[:T]/g,"")+".json"; }
+function reportText(){
+  const lines=["Ocean Scan — "+report.kind+" — "+new Date(report.time).toLocaleString(),"Car: "+report.car_state+(report.notes?" ("+report.notes+")":""),
+    "12V start/end: "+report.adapter_volts_start+" / "+report.adapter_volts_end+" V"];
+  if(report.silent_modules && report.silent_modules.length) lines.push("Silent: "+report.silent_modules.join(", "));
+  for(const [n,e] of Object.entries(report.modules||{})){
+    if(Array.isArray(e.dtcs)&&e.dtcs.length) lines.push(n+": "+e.dtcs.map(d=>d.code+(d.active?" ACTIVE":" stored")).join(", "));
+  }
+  if(report.car_readings) for(const [k,v] of Object.entries(report.car_readings)) lines.push(k+" "+v.label+": "+v.answer);
+  if(report.discovery) lines.push("Discovery "+report.discovery.module+" "+report.discovery.from+"-"+report.discovery.to+": "+report.discovery.found.length+" found");
+  if(report.listen) lines.push("Listen test: "+report.listen.frames+" frames, "+report.listen.distinct_ids+" IDs");
+  return lines.join("\n");
+}
+function blob(){ return new Blob([JSON.stringify(report,null,2)],{type:"application/json"}); }
+$("btnShare").onclick=async()=>{
+  const f=new File([blob()],fileName(),{type:"application/json"});
+  try{
+    if(navigator.canShare && navigator.canShare({files:[f]})) await navigator.share({files:[f],title:"Ocean Scan",text:reportText()});
+    else if(navigator.share) await navigator.share({title:"Ocean Scan",text:reportText()+"\n\n"+JSON.stringify(report)});
+    else throw new Error("no share");
+  }catch(e){ if(e.name!=="AbortError") $("progress").textContent="Sharing isn't available here. Use Save file or Copy text."; }
+};
+$("btnSave").onclick=()=>{ const a=document.createElement("a"); a.href=URL.createObjectURL(blob()); a.download=fileName(); document.body.appendChild(a); a.click(); a.remove(); };
+$("btnCopy").onclick=async()=>{
+  const t=reportText()+"\n\n"+JSON.stringify(report,null,2);
+  try{ await navigator.clipboard.writeText(t); $("progress").textContent="Copied. Paste it into the project chat."; }
+  catch(e){ $("log").textContent=t; $("progress").textContent="Copy was blocked. The full result is in the adapter log box; select and copy it there."; }
+};
+
+// ---------------------------------------------------------------- wiring
+$("btnConnect").onclick=async()=>{
+  try{
+    await btConnect(); setConn("busy","Checking adapter…");
+    const id=await elmInit(); const v=await adapterVolts();
+    setConn("on","Connected: "+id+(v?" · "+v+" V":"")); enable(true);
+    if(v){ $("sVolts").textContent=v.toFixed(1)+" V"; }
+  }catch(err){ setConn("err",String(err.message||err)); log("!! "+(err.message||err)); }
+};
+$("btnDisconnect").onclick=()=>{ stopFlag=true; try{ BT.device&&BT.device.gatt.disconnect(); }catch(_){} setConn("","Not connected"); enable(false); };
+$("btnFull").onclick=()=>runScan(MODULES.map(m=>m[0]));
+$("btnSound").onclick=()=>runScan(SOUND_POWER);
+$("btnListen").onclick=runListen;
+$("btnCar").onclick=runCar;
+$("btnObd").onclick=runObd;
+$("btnDetails").onclick=runDetails;
+$("btnRead").onclick=()=>runRead(false);
+$("btnWatch").onclick=()=>runRead(true);
+$("btnDisc").onclick=runDiscover;
+$("advModule").innerHTML=MODULES.map(([n])=>'<option>'+n+'</option>').join("");
+$("btnVolts").onclick=runVolts;
+$("btnStop").onclick=()=>{ stopFlag=true; $("progress").textContent="Stopping after the current step…"; };
+$("btnBtInfo").onclick=()=>{ log("[bt] device: "+(BT.device&&BT.device.name)); BT.services.forEach(s=>{ log("[bt] service "+s.uuid); s.chars.forEach(c=>log("[bt]    "+c.uuid+"  "+c.props.join(","))); }); };
+if("serviceWorker" in navigator && location.protocol==="https:"){ navigator.serviceWorker.register("sw.js").catch(()=>{}); }
+if(!("bluetooth" in navigator)){ $("noBt").hidden=false; $("btnConnect").disabled=true; }
+</script>
+</body>
+</html>
