@@ -84,7 +84,7 @@ details summary { cursor: pointer; font-weight: 600 }
   <header>
     <h1>Ocean Scan</h1>
     <p class="sub">Read-only scanner for the Fisker Ocean with a vLinker FD+. It never clears codes, resets modules or writes anything.</p>
-    <p class="small">Version 4 · 2026-11-20 · all read-only checks · results go to Claude automatically</p>
+    <p class="small">Version 5 · 2026-11-20 · all read-only checks · results go to Claude automatically</p>
   </header>
 
   <div id="noBt" class="note bad" hidden>
@@ -583,28 +583,53 @@ async function runCar(){
 }
 
 // Fault details: freeze frame (19 04) and extended data (19 06) for each code found by the last scan.
+// Fault details: freeze frame (19 04) and extended data (19 06) for each code found by the last scan.
+// Active codes first. Each request times out after 2 s; a module that doesn't support or answer
+// these requests is skipped after its first code, so one bad module can't hang the run.
+// Results are a separate "fault details" file, saved every minute while running and on stop/failure.
 async function runDetails(){
   if(!lastScan) return;
   running(true); stopFlag=false;
+  const det=newReport("fault details"); det.modules={}; det.scan_time=lastScan.time; det.car_state=lastScan.car_state;
+  det.details_status="running"; det.skipped_modules={};
+  report=det;
+  const todo=[];
+  for(const [name,e] of Object.entries(lastScan.modules)) if(Array.isArray(e.dtcs)) for(const d of e.dtcs) todo.push({name,d});
+  todo.sort((x,y)=>(y.d.active?1:0)-(x.d.active?1:0));
+  const total=todo.length, t0=Date.now(); let n=0, lastSave=Date.now();
+  const notAnswered=r=>r===null, unsupported=r=>r&&r[0]===0x7F&&[0x11,0x12,0x7E,0x7F].includes(r[2]);
+  const fmt=(r,sub)=> r===null?"no answer": r[0]===0x59?hex(r.slice(2)): r[0]===0x7F?describeNeg(r):hex(r);
+  const progress=()=>{ const left=n? Math.round((Date.now()-t0)/n*(total-n)/60000):null;
+    $("progress").textContent="Fault details: "+n+" of "+total+" codes"+(Object.keys(det.skipped_modules).length?" · skipped "+Object.keys(det.skipped_modules).join(", "):"")+(left!==null?" · about "+left+" min left":"")+". Press Stop to end early; what's done is saved."; };
   try{
-    await elmInit();
-    let n=0;
-    for(const [name,e] of Object.entries(lastScan.modules)){
-      if(!Array.isArray(e.dtcs)) continue;
-      const tx=moduleTx(name);
-      for(const d of e.dtcs){
-        if(stopFlag) break;
-        n++; $("progress").textContent="Reading details for "+name+" "+d.code+"…";
-        const b=dtcBytes(d.code);
-        const snap=await uds(tx,[0x19,0x04,...b,0xFF],4000);
-        const ext=await uds(tx,[0x19,0x06,...b,0xFF],4000);
-        d.details={snapshot: snap===null?"no answer": snap[0]===0x59?hex(snap.slice(2)): snap[0]===0x7F?describeNeg(snap):hex(snap),
-                   extended: ext===null?"no answer": ext[0]===0x59?hex(ext.slice(2)): ext[0]===0x7F?describeNeg(ext):hex(ext)};
+    det.adapter=await elmInit(); det.adapter_volts_start=await adapterVolts();
+    for(const {name,d} of todo){
+      if(stopFlag) break;
+      n++;
+      if(det.skipped_modules[name]) continue;
+      progress();
+      const tx=moduleTx(name), b=dtcBytes(d.code);
+      const snap=await uds(tx,[0x19,0x04,...b,0xFF],2000);
+      const mod=det.modules[name]||(det.modules[name]={request_id:lastScan.modules[name].request_id,dtcs:[],answered:true});
+      if(notAnswered(snap)||unsupported(snap)){
+        const firstForModule=!mod.dtcs.length;
+        if(firstForModule||notAnswered(snap)&&mod._misses>=1){ det.skipped_modules[name]=notAnswered(snap)?"no answer":describeNeg(snap); mod.dtcs.push({code:d.code,active:d.active,status:d.status,details:{snapshot:fmt(snap),extended:"skipped"}}); continue; }
+        if(notAnswered(snap)) mod._misses=(mod._misses||0)+1;
       }
+      const ext=await uds(tx,[0x19,0x06,...b,0xFF],2000);
+      mod.dtcs.push({code:d.code,active:d.active,status:d.status,status_hex:d.status_hex,details:{snapshot:fmt(snap),extended:fmt(ext)}});
+      if(Date.now()-lastSave>60000){ lastSave=Date.now(); det.details_status="running ("+n+" of "+total+")"; queueUpload(det); }
     }
-    report=lastScan; renderModules(); renderSummary();
-    $("progress").textContent="Fault details read for "+n+" codes (raw data; I'll decode them). Share or Save to send.";
-  }catch(err){ $("progress").textContent="Stopped: "+(err.message||err); }
+    det.details_status = stopFlag ? "stopped by you at "+n+" of "+total : "done";
+    $("progress").innerHTML = (stopFlag?"<b>Stopped.</b> ":"<b>Done.</b> ")+"Checked "+n+" of "+total+" codes; fault details saved"+(Object.keys(det.skipped_modules).length?" (skipped "+esc(Object.keys(det.skipped_modules).join(", "))+": they don't answer this request)":"")+".";
+  }catch(err){
+    det.details_status="failed at "+n+" of "+total+": "+(err.message||err);
+    $("progress").innerHTML="<b>Failed</b> at "+n+" of "+total+" ("+esc(err.message||err)+"). The "+n+" codes read so far are saved.";
+    try{ await elmInit(); }catch(_){}
+  }
+  try{ det.adapter_volts_end=await adapterVolts(); }catch(_){}
+  Object.values(det.modules).forEach(m=>delete m._misses);
+  report=det; renderModules(); renderSummary();
   running(false); exportsOn(true);
 }
 function dtcBytes(code){
@@ -690,11 +715,16 @@ function b64utf8(str){ const bytes=new TextEncoder().encode(str); let bin=""; fo
 function scanPath(r){ const t=(r.time||new Date().toISOString()); return "scans/"+t.slice(0,10)+"/"+t.slice(11,19).replace(/:/g,"")+"-"+(r.kind||"scan").replace(/\W+/g,"-")+".json"; }
 let uploadedTimes=new Set();
 function loadQueue(){ try{ return JSON.parse(LS.get("os.queue")||"[]"); }catch(_){ return []; } }
-function saveQueue(q){ LS.set("os.queue", JSON.stringify(q.slice(-30))); }
+function saveQueue(q){
+  let k=q.slice(-30);
+  while(true){ try{ localStorage.setItem("os.queue", JSON.stringify(k)); return; }catch(_){ if(!k.length) return; k=k.slice(1); } } // phone storage full: drop the oldest waiting result
+}
 function queueUpload(r){
-  if(uploadedTimes.has(r.time+r.kind+(r.reads?r.reads.length:"")+(r.volts?r.volts.length:""))) return;
-  const q=loadQueue(); q.push({path:scanPath(r), body:JSON.stringify(r,null,2)}); saveQueue(q);
-  uploadedTimes.add(r.time+r.kind+(r.reads?r.reads.length:"")+(r.volts?r.volts.length:""));
+  const path=scanPath(r), body=JSON.stringify(r,null,2);
+  if(uploadedTimes.has(path+"|"+body.length)) return;          // same result already sent
+  const q=loadQueue().filter(it=>it.path!==path);              // newer copy of the same file replaces the older one
+  q.push({path, body}); saveQueue(q);
+  uploadedTimes.add(path+"|"+body.length);
   flushQueue();
 }
 async function ghPut(cfg, path, content, message){
