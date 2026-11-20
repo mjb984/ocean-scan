@@ -84,7 +84,7 @@ details summary { cursor: pointer; font-weight: 600 }
   <header>
     <h1>Ocean Scan</h1>
     <p class="sub">Read-only scanner for the Fisker Ocean with a vLinker FD+. It never clears codes, resets modules or writes anything.</p>
-    <p class="small">Version 3 · 2026-11-20 · all read-only checks · results go to Claude automatically</p>
+    <p class="small">Version 4 · 2026-11-20 · all read-only checks · results go to Claude automatically</p>
   </header>
 
   <div id="noBt" class="note bad" hidden>
@@ -492,6 +492,7 @@ async function runScan(names){
         try{ await elmInit(); }catch(_){}
       }
       renderModules(); renderSummary();
+      live({type:"module", scan:report.kind, car_state:report.car_state, module:name, answered:e.answered, dtcs:e.dtcs, versions:e.versions});
     }
     report.adapter_volts_end=await adapterVolts();
     $("progress").textContent=(stopFlag?"Stopped. ":"Done. ")+"Use Share or Save to send me the result. The VIN is hidden."+(hasCodesIn(report)?" Fault details is now available.":"");
@@ -530,7 +531,7 @@ async function runVolts(){
     report.adapter=await elmInit();
     while(!stopFlag){
       const v=await adapterVolts(); const t=new Date().toISOString();
-      report.volts.push({time:t,volts:v}); report.adapter_volts_end=v; if(report.adapter_volts_start===null) report.adapter_volts_start=v;
+      report.volts.push({time:t,volts:v}); live({type:"volts", source:"vLinker", volts:v}); report.adapter_volts_end=v; if(report.adapter_volts_start===null) report.adapter_volts_start=v;
       renderSummary();
       $("progress").textContent="12V: "+v+" V at "+new Date().toLocaleTimeString()+" ("+report.volts.length+" readings, every 10 s). Press Stop when done."+(v!==null&&v<12.2?" Below 12.2 V.":"");
       for(let i=0;i<20 && !stopFlag;i++) await sleep(500);
@@ -644,6 +645,7 @@ async function runRead(watch){
       const raw=r&&r[0]===0x62&&!PRIVATE_DIDS.has(did)?r.slice(3):null;
       const line=showDid(did,r)+(raw?"  "+numberGuesses(raw):"");
       report.reads.push({time:new Date().toISOString(), module:name, did:did.toString(16).toUpperCase(), value:line});
+      live({type:"read", module:name, did:did.toString(16).toUpperCase(), value:line});
       showExtra(name+" "+did.toString(16).toUpperCase().padStart(4,"0"), [line]);
       if(watch){ $("progress").textContent="Watching "+name+" "+did.toString(16).toUpperCase()+" every 10 s ("+report.reads.length+" readings). Press Stop when done.";
         for(let i=0;i<20&&!stopFlag;i++) await sleep(500); }
@@ -704,10 +706,37 @@ async function ghPut(cfg, path, content, message){
     body:JSON.stringify({message, content:b64utf8(content), sha})});
   if(!res.ok){ const t=await res.text(); throw new Error("GitHub said "+res.status+(res.status===404?" (repo name or key access wrong)":res.status===401?" (key not valid)":res.status===403?" (key can't write to this repo)":"")+" "+t.slice(0,120)); }
 }
+// Home server mode: when the app is opened from your own server (it answers /api/health),
+// results go there (it saves to the NAS, MQTT and GitHub) and live readings stream to it. No key needed.
+let serverMode=null;
+async function detectServer(){
+  if(serverMode!==null) return serverMode;
+  try{ const r=await fetch("api/health",{cache:"no-store"}); serverMode = r.ok && (await r.json()).server==="ocean-scan-server"; }
+  catch(_){ serverMode=false; }
+  return serverMode;
+}
+function live(ev){
+  if(!serverMode) return;
+  fetch("api/live",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(Object.assign({time:new Date().toISOString()},ev))}).catch(()=>{});
+}
 let flushing=false;
 async function flushQueue(){
   const cfg=ghCfg();
   const q=loadQueue();
+  if(await detectServer()){
+    if(flushing||!q.length) return; flushing=true;
+    try{
+      while(true){
+        const cur=loadQueue(); if(!cur.length) break;
+        const item=cur[0]; setSend("busy","Sending "+item.path.split("/").pop()+" to your home server…");
+        const res=await fetch("api/scan",{method:"POST",headers:{"Content-Type":"application/json"},body:item.body});
+        if(!res.ok) throw new Error("Home server said "+res.status);
+        saveQueue(loadQueue().slice(1));
+        setSend("on","Saved at home and sent to Claude: "+item.path.split("/").pop()+" at "+new Date().toLocaleTimeString());
+      }
+    }catch(err){ setSend("err","Couldn't reach your home server (no signal?). "+loadQueue().length+" result(s) will be sent later."); }
+    flushing=false; return;
+  }
   if(!cfg.token){ if(q.length) setSend("busy", q.length+" result(s) waiting. Set up the key below to send them."); return; }
   if(flushing||!q.length) return; flushing=true;
   try{
@@ -734,7 +763,8 @@ $("btnSaveKey").onclick=async()=>{
   }catch(err){ setSend("err",String(err.message||err)); }
 };
 $("btnForget").onclick=()=>{ LS.del("os.ghToken"); setSend("","Key removed from this phone."); };
-(function initSend(){ const c=ghCfg(); if(c.token){ setSend("on","Ready: results go to "+c.repo+" automatically."); flushQueue(); } else { $("sendSetup").open=true; } })();
+(async function initSend(){ if(await detectServer()){ setSend("on","Home server connected: results save automatically, live readings stream while you scan."); $("sendSetup").open=false; $("sendSetup").hidden=true; flushQueue(); return; }
+  const c=ghCfg(); if(c.token){ setSend("on","Ready: results go to "+c.repo+" automatically."); flushQueue(); } else { $("sendSetup").open=true; } })();
 function fileName(){ return "ocean-"+(report.kind||"scan").replace(/\W+/g,"-")+"-"+report.time.slice(0,16).replace(/[:T]/g,"")+".json"; }
 function reportText(){
   const lines=["Ocean Scan — "+report.kind+" — "+new Date(report.time).toLocaleString(),"Car: "+report.car_state+(report.notes?" ("+report.notes+")":""),
