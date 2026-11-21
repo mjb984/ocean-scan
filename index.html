@@ -84,7 +84,7 @@ details summary { cursor: pointer; font-weight: 600 }
   <header>
     <h1>Ocean Scan</h1>
     <p class="sub">Read-only scanner for the Fisker Ocean with a vLinker FD+. It never clears codes, resets modules or writes anything.</p>
-    <p class="small">Version 5 · 2026-11-20 · all read-only checks · results go to Claude automatically</p>
+    <p class="small">Version 6 · 2026-11-21 · all read-only checks · results go to Claude automatically</p>
   </header>
 
   <div id="noBt" class="note bad" hidden>
@@ -170,6 +170,26 @@ details summary { cursor: pointer; font-weight: 600 }
       <button id="btnDisc" disabled>Discover readable data on this module</button>
     </div>
     <p class="small">Discovery asks the chosen module for every data ID in the range, one at a time, and lists the ones it answers. Up to 1,024 IDs per run, about 4 per second. It stops by itself if the 12V drops below 11.8 V. Good ranges to try: F180–F1FF (identification), then 0100–01FF, DD00–DDFF, then wider.</p>
+  </section>
+
+  <section aria-labelledby="h-usb">
+    <h2 id="h-usb">USB CAN adapter (listen-only)</h2>
+    <p class="small" style="margin-bottom:8px">For a CANable-type adapter plugged into this phone or tablet's USB-C port (OTG adapter if needed), wired to the car as in the CAN adapter guide. It only listens: the adapter is opened in listen-only mode, so it never sends anything, not even acknowledgements. Chrome on Android only.</p>
+    <div class="row" style="margin-bottom:8px"><div class="status"><span id="usbDot" class="dot"></span><span id="usbText">Not connected</span></div></div>
+    <div class="row">
+      <label for="usbRate">Bus speed
+        <select id="usbRate"><option value="500000">500 kbit/s (diagnostic bus, start here)</option><option value="250000">250 kbit/s</option><option value="125000">125 kbit/s</option><option value="1000000">1 Mbit/s</option></select>
+      </label>
+      <label for="usbSecs">Capture length
+        <select id="usbSecs"><option value="30">30 seconds</option><option value="120">2 minutes</option><option value="600">10 minutes</option><option value="0">Until I press Stop</option></select>
+      </label>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <button id="btnUsbConnect">Connect USB CAN</button>
+      <button id="btnUsbCapture" disabled>Start listening</button>
+      <button id="btnUsbStop" disabled>Stop</button>
+    </div>
+    <p id="usbProgress" class="small" style="margin-top:8px">Works with candleLight firmware (shows as gs_usb) and slcan firmware. Nothing is sent on the car's network.</p>
   </section>
 
   <section aria-labelledby="h-sum" id="summary">
@@ -704,6 +724,93 @@ async function runDiscover(){
   }catch(err){ await finish("Stopped: "+(err.message||err)); }
 }
 
+// ---------------------------------------------------------------- USB CAN adapter (WebUSB), listen-only
+// Two firmware types, both written from their public protocol descriptions:
+//  - candleLight / gs_usb (Linux gs_usb driver protocol): vendor control requests + 20-byte bulk frames.
+//  - slcan / LAWICEL (CDC serial): ASCII commands. We only send S<n> (speed), L (open listen-only) and C (close).
+// Safety: the adapter is always opened LISTEN-ONLY. No transmit command exists in this code.
+const USB = { dev:null, kind:null, epIn:null, epOut:null, iface:null, stop:false };
+const GS = { HOST_FORMAT:0, BITTIMING:1, MODE:2, BT_CONST:4, MODE_RESET:0, MODE_START:1, FLAG_LISTEN_ONLY:1 };
+const SLCAN_ALLOWED=/^(C|S[0-8]|L|V|v)$/;
+function setUsb(kind,text){ $("usbDot").className="dot "+(kind||""); $("usbText").textContent=text; }
+async function usbConnect(){
+  if(!("usb" in navigator)) throw new Error("This browser can't use USB. Use Chrome on Android with an OTG/USB-C adapter.");
+  const dev=await navigator.usb.requestDevice({filters:[{vendorId:0x1d50,productId:0x606f},{vendorId:0x1209,productId:0x2323},{vendorId:0x16d0,productId:0x117e},{vendorId:0xad50},{vendorId:0x0483},{vendorId:0x1209}]});
+  await dev.open(); if(dev.configuration===null) await dev.selectConfiguration(1);
+  const ifs=dev.configuration.interfaces;
+  const vendor=ifs.find(i=>i.alternates[0].interfaceClass===0xFF && i.alternates[0].endpoints.some(e=>e.direction==="in"&&e.type==="bulk"));
+  const cdcData=ifs.find(i=>i.alternates[0].interfaceClass===0x0A);
+  const pick=vendor||cdcData; if(!pick) throw new Error("Adapter found but no usable interface. Send me a screenshot of 'Show adapter details'.");
+  await dev.claimInterface(pick.interfaceNumber);
+  const alt=pick.alternates[0];
+  USB.dev=dev; USB.iface=pick.interfaceNumber; USB.kind=vendor?"gs_usb":"slcan";
+  USB.epIn=alt.endpoints.find(e=>e.direction==="in"&&e.type==="bulk").endpointNumber;
+  USB.epOut=(alt.endpoints.find(e=>e.direction==="out"&&e.type==="bulk")||{}).endpointNumber;
+  if(USB.kind==="slcan"){ const ctl=ifs.find(i=>i.alternates[0].interfaceClass===0x02);
+    if(ctl){ try{ await dev.claimInterface(ctl.interfaceNumber); await dev.controlTransferOut({requestType:"class",recipient:"interface",request:0x22,value:0x03,index:ctl.interfaceNumber}); }catch(_){} } }
+  USB.name=(dev.productName||"USB CAN")+" ("+(USB.kind==="gs_usb"?"candleLight":"slcan")+")"; return USB.name;
+}
+async function gsCtrlOut(req,data){ return USB.dev.controlTransferOut({requestType:"vendor",recipient:"interface",request:req,value:0,index:USB.iface},data); }
+async function gsStart(bitrate){
+  const h=new DataView(new ArrayBuffer(4)); h.setUint32(0,0x0000beef,true); await gsCtrlOut(GS.HOST_FORMAT,h.buffer).catch(()=>{});
+  const r=await USB.dev.controlTransferIn({requestType:"vendor",recipient:"interface",request:GS.BT_CONST,value:0,index:USB.iface},40);
+  const fclk=r.data.getUint32(4,true);
+  // 16 time quanta per bit, sample point 87.5% (1 sync + 1 prop + 12 phase1 + 2 phase2)
+  const brp=Math.round(fclk/(bitrate*16)); if(!brp||fclk/(brp*16)!==bitrate) throw new Error("Adapter clock "+fclk+" Hz can't make "+bitrate+" bit/s exactly");
+  const bt=new DataView(new ArrayBuffer(20)); [1,12,2,1,brp].forEach((v,i)=>bt.setUint32(i*4,v,true));
+  const m0=new DataView(new ArrayBuffer(8)); m0.setUint32(0,GS.MODE_RESET,true); await gsCtrlOut(GS.MODE,m0.buffer).catch(()=>{});
+  await gsCtrlOut(GS.BITTIMING,bt.buffer);
+  const m=new DataView(new ArrayBuffer(8)); m.setUint32(0,GS.MODE_START,true); m.setUint32(4,GS.FLAG_LISTEN_ONLY,true);
+  await gsCtrlOut(GS.MODE,m.buffer);
+}
+async function gsStop(){ const m=new DataView(new ArrayBuffer(8)); m.setUint32(0,GS.MODE_RESET,true); await gsCtrlOut(GS.MODE,m.buffer).catch(()=>{}); }
+async function slcanCmd(c){ if(!SLCAN_ALLOWED.test(c)) throw new Error("Safety stop: slcan command "+c+" not allowed"); await USB.dev.transferOut(USB.epOut,new TextEncoder().encode(c+"\r")); }
+const SLCAN_SPEED={10000:"S0",20000:"S1",50000:"S2",100000:"S3",125000:"S4",250000:"S5",500000:"S6",800000:"S7",1000000:"S8"};
+function parseSlcan(line){ // t iii l dd.. | T iiiiiiii l dd.. (r/R = remote, no data)
+  const c=line[0]; if(!"tTrR".includes(c)) return null;
+  const ext=c==="T"||c==="R", idLen=ext?8:3, id=parseInt(line.slice(1,1+idLen),16), dlc=parseInt(line[1+idLen],16);
+  const data=c==="t"||c==="T"? line.slice(2+idLen,2+idLen+dlc*2):""; if(isNaN(id)||isNaN(dlc)) return null;
+  return {id,ext,dlc,data:data.toUpperCase()};
+}
+function parseGs(dv,off){ const raw=dv.getUint32(off+4,true), dlc=dv.getUint8(off+8); const ext=!!(raw&0x80000000), id=raw&(ext?0x1FFFFFFF:0x7FF);
+  if(dv.getUint32(off,true)!==0xFFFFFFFF) return null; // echo of our own transmit (never happens: we never transmit)
+  let d=""; for(let i=0;i<Math.min(dlc,8);i++) d+=dv.getUint8(off+12+i).toString(16).padStart(2,"0").toUpperCase(); return {id,ext,dlc,data:d,err:!!(raw&0x20000000)}; }
+async function usbCapture(){
+  const rate=parseInt($("usbRate").value,10), secs=parseInt($("usbSecs").value,10);
+  USB.stop=false; $("btnUsbCapture").disabled=true; $("btnUsbStop").disabled=false; $("btnUsbConnect").disabled=true;
+  const cap=newReport("can capture"); cap.can={adapter:USB.name, firmware:USB.kind, bitrate:rate, listen_only:true, seconds:secs||"until stop", frames:0, error_frames:0, ids:{}, log:[]};
+  report=cap; const t0=performance.now(); let lastLive=Date.now(), lastSave=Date.now(), lastIds=0; const MAXLOG=60000; // about 2 MB of log; counts per ID keep going after that
+  const add=f=>{ if(!f) return; if(f.err){ cap.can.error_frames++; return; } cap.can.frames++;
+    const key=(f.ext?f.id.toString(16).padStart(8,"0"):f.id.toString(16).padStart(3,"0")).toUpperCase(); const e=cap.can.ids[key]||(cap.can.ids[key]={count:0,dlc:f.dlc,last:""}); e.count++; e.last=f.data;
+    if(cap.can.log.length<MAXLOG) cap.can.log.push("("+((performance.now()-t0)/1000).toFixed(6)+") can0 "+key+"#"+f.data); };
+  try{
+    if(USB.kind==="gs_usb") await gsStart(rate); else { await slcanCmd("C").catch(()=>{}); await slcanCmd(SLCAN_SPEED[rate]); await slcanCmd("L"); }
+    setUsb("on","Listening at "+rate/1000+" kbit/s (listen-only)");
+    let buf="";
+    while(!USB.stop && (secs===0 || performance.now()-t0 < secs*1000)){
+      const r=await Promise.race([USB.dev.transferIn(USB.epIn, USB.kind==="gs_usb"?64*20:512), sleep(1000).then(()=>null)]);
+      if(r && r.data && r.data.byteLength){
+        if(USB.kind==="gs_usb"){ for(let o=0;o+20<=r.data.byteLength;o+=20) add(parseGs(r.data,o)); }
+        else { buf+=new TextDecoder().decode(r.data); const parts=buf.split("\r"); buf=parts.pop(); parts.forEach(l=>add(parseSlcan(l.trim()))); }
+      }
+      const el=(performance.now()-t0)/1000;
+      $("usbProgress").textContent="Listening "+Math.round(el)+" s"+(secs?" of "+secs:"")+": "+cap.can.frames+" frames from "+Object.keys(cap.can.ids).length+" IDs"+(cap.can.error_frames?", "+cap.can.error_frames+" error frames (wrong speed or wiring?)":"")+". Nothing is sent to the car.";
+      if(Date.now()-lastLive>2000){ lastLive=Date.now(); const n=Object.keys(cap.can.ids).length; live({type:"can", seconds:Math.round(el), frames:cap.can.frames, ids:n, new_ids:n-lastIds, error_frames:cap.can.error_frames}); lastIds=n; }
+      if(Date.now()-lastSave>60000){ lastSave=Date.now(); cap.can.status="running"; queueUpload(cap); }
+    }
+    cap.can.status=USB.stop?"stopped by you":"done";
+    $("usbProgress").innerHTML="<b>Done.</b> "+cap.can.frames+" frames from "+Object.keys(cap.can.ids).length+" IDs saved"+(cap.can.frames?"":". Nothing heard: check wiring (pins 6 and 14), try another speed, or the port may be quiet")+".";
+  }catch(err){ cap.can.status="failed: "+(err.message||err); $("usbProgress").innerHTML="<b>Failed:</b> "+esc(err.message||err)+(cap.can.frames?". The "+cap.can.frames+" frames heard so far are saved.":""); }
+  try{ if(USB.kind==="gs_usb") await gsStop(); else await slcanCmd("C"); }catch(_){}
+  setUsb("on","Connected: "+USB.name);
+  $("btnUsbCapture").disabled=false; $("btnUsbStop").disabled=true; $("btnUsbConnect").disabled=false;
+  exportsOn(true);
+}
+$("btnUsbConnect").onclick=async()=>{ try{ setUsb("busy","Connecting…"); const name=await usbConnect(); setUsb("on","Connected: "+name); $("btnUsbCapture").disabled=false; }catch(err){ setUsb("err",String(err.message||err)); } };
+$("btnUsbCapture").onclick=usbCapture;
+$("btnUsbStop").onclick=()=>{ USB.stop=true; };
+if(!("usb" in navigator)){ $("btnUsbConnect").disabled=true; setUsb("","This browser can't use USB (Chrome on Android or a computer can)."); }
+
 // ---------------------------------------------------------------- export
 function exportsOn(on){ ["btnShare","btnSave","btnCopy"].forEach(id=>$(id).disabled=!on); if(on && report) queueUpload(report); }
 
@@ -714,10 +821,12 @@ function setSend(kind,text){ $("sendDot").className="dot "+(kind||""); $("sendTe
 function b64utf8(str){ const bytes=new TextEncoder().encode(str); let bin=""; for(let i=0;i<bytes.length;i+=0x8000) bin+=String.fromCharCode(...bytes.subarray(i,i+0x8000)); return btoa(bin); }
 function scanPath(r){ const t=(r.time||new Date().toISOString()); return "scans/"+t.slice(0,10)+"/"+t.slice(11,19).replace(/:/g,"")+"-"+(r.kind||"scan").replace(/\W+/g,"-")+".json"; }
 let uploadedTimes=new Set();
-function loadQueue(){ try{ return JSON.parse(LS.get("os.queue")||"[]"); }catch(_){ return []; } }
+let memQ=null; // used when phone storage is full or blocked, so a big capture still gets sent this session
+function loadQueue(){ if(memQ) return memQ.slice(); try{ return JSON.parse(LS.get("os.queue")||"[]"); }catch(_){ return []; } }
 function saveQueue(q){
-  let k=q.slice(-30);
-  while(true){ try{ localStorage.setItem("os.queue", JSON.stringify(k)); return; }catch(_){ if(!k.length) return; k=k.slice(1); } } // phone storage full: drop the oldest waiting result
+  const k=q.slice(-30);
+  try{ localStorage.setItem("os.queue", JSON.stringify(k)); memQ=null; }
+  catch(_){ memQ=k; try{ localStorage.setItem("os.queue", JSON.stringify(k.filter(it=>it.body.length<500000))); }catch(__){} } // too big for phone storage: keep in memory and send now
 }
 function queueUpload(r){
   const path=scanPath(r), body=JSON.stringify(r,null,2);
