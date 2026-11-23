@@ -84,7 +84,7 @@ details summary { cursor: pointer; font-weight: 600 }
   <header>
     <h1>Ocean Scan</h1>
     <p class="sub">Read-only scanner for the Fisker Ocean with a vLinker FD+. It never clears codes, resets modules or writes anything.</p>
-    <p class="small">Version 6 · 2026-11-21 · all read-only checks · results go to Claude automatically</p>
+    <p class="small">Version 7 · 2026-11-23 · read-only checks, plus owner-approved reset and clear for one module at a time</p>
   </header>
 
   <div id="noBt" class="note bad" hidden>
@@ -170,6 +170,33 @@ details summary { cursor: pointer; font-weight: 600 }
       <button id="btnDisc" disabled>Discover readable data on this module</button>
     </div>
     <p class="small">Discovery asks the chosen module for every data ID in the range, one at a time, and lists the ones it answers. Up to 1,024 IDs per run, about 4 per second. It stops by itself if the 12V drops below 11.8 V. Good ranges to try: F180–F1FF (identification), then 0100–01FF, DD00–DDFF, then wider.</p>
+  </section>
+
+  <section aria-labelledby="h-svc">
+    <details id="svcBox">
+      <summary id="h-svc"><b>Service: reset or clear codes on one module</b> (changes the car)</summary>
+      <div class="note" style="margin:10px 0">These commands change the car, unlike everything else here. Car in Park, not charging, not driving. One module at a time.
+        Airbag, brakes, steering, motors, HV battery and driver assist are locked out. VCU (drive controller) can only have its codes cleared, never reset. A module that is silent can't be reset; it needs power, fuse or wiring checks.</div>
+      <div class="row">
+        <label for="svcModule">Module
+          <select id="svcModule"></select>
+        </label>
+        <label for="svcAction">Action
+          <select id="svcAction">
+            <option value="clear">Clear its fault codes</option>
+            <option value="soft">Soft reset (restart its software)</option>
+            <option value="hard">Hard reset (like unplugging it)</option>
+          </select>
+        </label>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <label for="svcConfirm">Type the module name to confirm
+          <input id="svcConfirm" autocomplete="off" autocapitalize="characters" placeholder="e.g. TBOX">
+        </label>
+      </div>
+      <div class="row" style="margin-top:8px"><button id="btnSvc" disabled>Run on this module</button></div>
+      <p id="svcProgress" class="small" style="margin-top:8px">Needs a Full or Sound scan saved in the last 30 minutes, the module answering in it, and the 12V at 12.0 V or more. Afterwards it re-reads the module and saves a before and after record.</p>
+    </details>
   </section>
 
   <section aria-labelledby="h-usb">
@@ -421,7 +448,7 @@ async function adapterVolts(){
 }
 
 // ---------------------------------------------------------------- UI state
-let stopFlag=false, report=null, lastScan=null;
+var stopFlag=false, report=null, lastScan=null;
 const ACTION_BTNS=["btnFull","btnSound","btnListen","btnVolts","btnCar","btnObd","btnRead","btnWatch","btnDisc"];
 function hasCodes(){ return !!lastScan && Object.values(lastScan.modules).some(m=>Array.isArray(m.dtcs)&&m.dtcs.length); }
 function setConn(kind,text){ $("dot").className="dot "+(kind||""); $("connText").textContent=text; }
@@ -723,6 +750,83 @@ async function runDiscover(){
     await finish("Discovery finished: "+found.length+" data IDs answered. Share or Save to send.");
   }catch(err){ await finish("Stopped: "+(err.message||err)); }
 }
+
+// ---------------------------------------------------------------- Service actions (owner-approved 2026-11-23, decision card)
+// Only standard ISO 14229 services: 0x14 ClearDiagnosticInformation (all groups FFFFFF) and 0x11 ECUReset
+// (01 hard, 03 soft). No security access, no session change, no routines, no writes of data.
+// Safety-critical modules are locked out. Everything else in this page stays read-only (guardUds).
+const SVC_LOCKED = new Set(["ACU","ESP","iBooster","EPS","EPS2","BMS","MCU_F","MCU_R","ADAS"]);
+const SVC_ACTIONS = { clear:{payload:[0x14,0xFF,0xFF,0xFF], ok:0x54, label:"clear codes"},
+                      soft:{payload:[0x11,0x03], ok:0x51, label:"soft reset"},
+                      hard:{payload:[0x11,0x01], ok:0x51, label:"hard reset"} };
+const SVC_NO_RESET = new Set(["VCU"]); // drive controller: clear codes only, never reset
+function guardService(name, p){
+  if(SVC_LOCKED.has(name)) throw new Error("Safety stop: "+name+" is locked out of service actions");
+  if(SVC_NO_RESET.has(name) && p[0]===0x11) throw new Error("Safety stop: "+name+" can't be reset from here, only its codes cleared");
+  const okP = Object.values(SVC_ACTIONS).some(a=>a.payload.length===p.length && a.payload.every((b,i)=>b===p[i]));
+  if(!okP) throw new Error("Safety stop: service request "+hex(p)+" is not allowed");
+}
+async function udsService(name, tx, payload){
+  guardService(name, payload);
+  await setTarget(tx); await sleep(150);
+  const line=hex(payload).replace(/ /g,"");
+  let r=pickResponse(parseIsotp(await raw(line,5000),tx+8));
+  for(let n=0; r && r.length>=3 && r[0]===0x7F && r[2]===0x78 && n<5; n++){ // response pending: wait, don't resend a change
+    await sleep(1500); try{ const more=await readPrompt(3000); r=pickResponse(parseIsotp(more.split(/[\r\n]+/),tx+8)); }catch(_){ break; }
+  }
+  return r;
+}
+function svcModules(){ return MODULES.filter(([n])=>!SVC_LOCKED.has(n)).map(([n])=>n); }
+function svcCheck(){
+  const name=$("svcModule").value, typed=$("svcConfirm").value.trim().toUpperCase();
+  $("btnSvc").disabled = !(BT.writeChar && !ELM.busy && typed===name.toUpperCase());
+}
+async function runService(){
+  const name=$("svcModule").value, act=SVC_ACTIONS[$("svcAction").value], tx=moduleTx(name);
+  const say=(h)=>{ $("svcProgress").innerHTML=h; };
+  // safeguards
+  if(!lastScan || Date.now()-Date.parse(lastScan.time)>30*60000){ say("<b>Not run.</b> Run a Full scan (or Sound + power) first, so the codes are saved before anything changes."); return; }
+  const before=lastScan.modules[name];
+  if(!before || !before.answered){ say("<b>Not run.</b> "+esc(name)+" didn't answer in the last scan. A silent module can't take a reset; check its power, fuses and wiring."); return; }
+  running(true); stopFlag=false;
+  const rec=newReport("service "+act.label+" "+name); rec.modules={}; rec.service={module:name, action:act.label, request:hex(act.payload), before_scan:lastScan.time, before:{dtcs:before.dtcs, versions:before.versions}};
+  report=rec;
+  try{
+    await elmInit();
+    const v=await adapterVolts(); rec.adapter_volts_start=v;
+    if(v!==null && v<12.0) throw new Error("12V is "+v+" V. Charge it to 12.0 V or more first.");
+    say("Sending "+esc(act.label)+" to "+esc(name)+"…");
+    const r=await udsService(name, tx, act.payload);
+    rec.service.response = r===null?"no answer": hex(r);
+    const pending = r && r.length>=3 && r[0]===0x7F && r[2]===0x78;
+    if(r===null && act.payload[0]!==0x11) throw new Error(name+" did not answer the command. Nothing changed as far as we can tell.");
+    if(r && !pending && r[0]===0x7F) throw new Error(name+" "+describeNeg(r)+". Nothing was changed.");
+    if(r && !pending && r[0]!==act.ok) throw new Error("Unexpected answer "+hex(r));
+    rec.service.result = (r && !pending) ? "accepted" : "unconfirmed (no final answer; the re-read below shows what happened)";
+    say(esc(name)+(rec.service.result==="accepted"?" accepted the ":" gave no final answer to the ")+esc(act.label)+". Waiting 8 seconds, then re-reading it…");
+    await sleep(8000);
+    await elmInit();
+    const after={};
+    const s=await uds(tx,[0x22,0xF1,0x89]); after.software= s===null?null: s[0]===0x62?asciiOrHex(s.slice(3)): describeNeg(s);
+    const d=await uds(tx,[0x19,0x02,0xFF],4000);
+    after.dtcs = d===null?null : d[0]===0x59?decodeDtcs(d) : describeNeg(d);
+    after.answered = after.software!==null || after.dtcs!==null;
+    rec.service.after=after;
+    rec.modules[name]={request_id:before.request_id, answered:after.answered, dtcs:after.dtcs, versions:{software:after.software}};
+    const nb=Array.isArray(before.dtcs)?before.dtcs.length:0, na=Array.isArray(after.dtcs)?after.dtcs.length:0;
+    const act2=Array.isArray(after.dtcs)?after.dtcs.filter(x=>x.active).length:0;
+    say("<b>Done.</b> "+esc(name)+" "+esc(act.label)+" "+(rec.service.result==="accepted"?"accepted":"unconfirmed")+". Codes before: "+nb+", after: "+(after.dtcs===null?"no answer yet":na+" ("+act2+" active, these are the real current faults)")+". Saved.");
+  }catch(err){
+    rec.service.result = rec.service.result || ("not done: "+(err.message||err));
+    say("<b>Stopped.</b> "+esc(err.message||err));
+    try{ await elmInit(); }catch(_){}
+  }
+  try{ rec.adapter_volts_end=await adapterVolts(); }catch(_){}
+  $("svcConfirm").value=""; renderModules(); renderSummary(); running(false); exportsOn(true); svcCheck();
+}
+$("svcModule").innerHTML=svcModules().map(n=>'<option>'+n+'</option>').join("");
+$("svcModule").onchange=svcCheck; $("svcConfirm").oninput=svcCheck; $("btnSvc").onclick=runService;
+setInterval(svcCheck, 1000);
 
 // ---------------------------------------------------------------- USB CAN adapter (WebUSB), listen-only
 // Two firmware types, both written from their public protocol descriptions:
