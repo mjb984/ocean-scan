@@ -84,7 +84,7 @@ details summary { cursor: pointer; font-weight: 600 }
   <header>
     <h1>Ocean Scan</h1>
     <p class="sub">Read-only scanner for the Fisker Ocean with a vLinker FD+. It never clears codes, resets modules or writes anything.</p>
-    <p class="small">Version 7 · 2026-11-23 · read-only checks, plus owner-approved reset and clear for one module at a time</p>
+    <p class="small">Version 7.1 · 2026-11-24 · read-only checks, plus owner-approved reset and clear for one module at a time</p>
   </header>
 
   <div id="noBt" class="note bad" hidden>
@@ -213,6 +213,7 @@ details summary { cursor: pointer; font-weight: 600 }
     </div>
     <div class="row" style="margin-top:8px">
       <button id="btnUsbConnect">Connect USB CAN</button>
+        <button id="btnUsbSerial">Connect (serial mode)</button>
       <button id="btnUsbCapture" disabled>Start listening</button>
       <button id="btnUsbStop" disabled>Stop</button>
     </div>
@@ -837,22 +838,46 @@ const USB = { dev:null, kind:null, epIn:null, epOut:null, iface:null, stop:false
 const GS = { HOST_FORMAT:0, BITTIMING:1, MODE:2, BT_CONST:4, MODE_RESET:0, MODE_START:1, FLAG_LISTEN_ONLY:1 };
 const SLCAN_ALLOWED=/^(C|S[0-8]|L|V|v)$/;
 function setUsb(kind,text){ $("usbDot").className="dot "+(kind||""); $("usbText").textContent=text; }
+async function claimWithRetry(dev, n){
+  try{ await dev.claimInterface(n); return; }catch(e1){
+    try{ await dev.reset(); }catch(_){}
+    try{ await dev.claimInterface(n); return; }catch(e2){
+      try{ await dev.close(); }catch(_){} try{ await dev.open(); if(dev.configuration===null) await dev.selectConfiguration(1); }catch(_){}
+      await dev.claimInterface(n); } }
+}
 async function usbConnect(){
   if(!("usb" in navigator)) throw new Error("This browser can't use USB. Use Chrome on Android with an OTG/USB-C adapter.");
   const dev=await navigator.usb.requestDevice({filters:[{vendorId:0x1d50,productId:0x606f},{vendorId:0x1209,productId:0x2323},{vendorId:0x16d0,productId:0x117e},{vendorId:0xad50},{vendorId:0x0483},{vendorId:0x1209}]});
+  if(dev.opened){ try{ await dev.close(); }catch(_){} }   // a failed earlier try can leave it half-open
   await dev.open(); if(dev.configuration===null) await dev.selectConfiguration(1);
   const ifs=dev.configuration.interfaces;
+  USB.info=ifs.map(i=>"if"+i.interfaceNumber+" class 0x"+i.alternates[0].interfaceClass.toString(16)+(i.claimed?" (claimed)":"")).join(", ");
   const vendor=ifs.find(i=>i.alternates[0].interfaceClass===0xFF && i.alternates[0].endpoints.some(e=>e.direction==="in"&&e.type==="bulk"));
   const cdcData=ifs.find(i=>i.alternates[0].interfaceClass===0x0A);
-  const pick=vendor||cdcData; if(!pick) throw new Error("Adapter found but no usable interface. Send me a screenshot of 'Show adapter details'.");
-  await dev.claimInterface(pick.interfaceNumber);
+  const pick=vendor||cdcData; if(!pick) throw new Error("Adapter found but no usable interface ("+USB.info+").");
+  const ctl=vendor?null:ifs.find(i=>i.alternates[0].interfaceClass===0x02);
+  if(ctl){ try{ await claimWithRetry(dev, ctl.interfaceNumber); }catch(_){} }  // some phones want the CDC control part taken first
+  try{ await claimWithRetry(dev, pick.interfaceNumber); }
+  catch(e){ try{ await dev.close(); }catch(_){}
+    throw new Error("The phone won't hand the adapter to Chrome ("+(e.message||e)+"; "+USB.info+")."+("serial" in navigator?" Try the 'Connect (serial mode)' button.":" Unplug it, close any other app that opened for it, and try again.")); }
   const alt=pick.alternates[0];
-  USB.dev=dev; USB.iface=pick.interfaceNumber; USB.kind=vendor?"gs_usb":"slcan";
+  USB.dev=dev; USB.port=null; USB.iface=pick.interfaceNumber; USB.kind=vendor?"gs_usb":"slcan";
   USB.epIn=alt.endpoints.find(e=>e.direction==="in"&&e.type==="bulk").endpointNumber;
   USB.epOut=(alt.endpoints.find(e=>e.direction==="out"&&e.type==="bulk")||{}).endpointNumber;
-  if(USB.kind==="slcan"){ const ctl=ifs.find(i=>i.alternates[0].interfaceClass===0x02);
-    if(ctl){ try{ await dev.claimInterface(ctl.interfaceNumber); await dev.controlTransferOut({requestType:"class",recipient:"interface",request:0x22,value:0x03,index:ctl.interfaceNumber}); }catch(_){} } }
+  if(ctl){ try{ await dev.controlTransferOut({requestType:"class",recipient:"interface",request:0x22,value:0x03,index:ctl.interfaceNumber}); }catch(_){} }
   USB.name=(dev.productName||"USB CAN")+" ("+(USB.kind==="gs_usb"?"candleLight":"slcan")+")"; return USB.name;
+}
+// Web Serial route for slcan adapters (used when the phone won't let Chrome claim the USB interface).
+async function serialConnect(){
+  if(!("serial" in navigator)) throw new Error("This Chrome has no serial support. Update Chrome, or use a laptop.");
+  const port=await navigator.serial.requestPort({});
+  await port.open({baudRate:115200});
+  USB.port=port; USB.dev=null; USB.kind="slcan"; USB.reader=port.readable.getReader();
+  USB.name="USB CAN (slcan, serial mode)"; return USB.name;
+}
+async function usbRead(len){
+  if(USB.port){ const {value}=await USB.reader.read(); return value? {data:new DataView(value.buffer,value.byteOffset,value.byteLength)} : null; }
+  return USB.dev.transferIn(USB.epIn,len);
 }
 async function gsCtrlOut(req,data){ return USB.dev.controlTransferOut({requestType:"vendor",recipient:"interface",request:req,value:0,index:USB.iface},data); }
 async function gsStart(bitrate){
@@ -868,7 +893,8 @@ async function gsStart(bitrate){
   await gsCtrlOut(GS.MODE,m.buffer);
 }
 async function gsStop(){ const m=new DataView(new ArrayBuffer(8)); m.setUint32(0,GS.MODE_RESET,true); await gsCtrlOut(GS.MODE,m.buffer).catch(()=>{}); }
-async function slcanCmd(c){ if(!SLCAN_ALLOWED.test(c)) throw new Error("Safety stop: slcan command "+c+" not allowed"); await USB.dev.transferOut(USB.epOut,new TextEncoder().encode(c+"\r")); }
+async function slcanCmd(c){ if(!SLCAN_ALLOWED.test(c)) throw new Error("Safety stop: slcan command "+c+" not allowed"); const b=new TextEncoder().encode(c+"\r");
+  if(USB.port){ const w=USB.port.writable.getWriter(); try{ await w.write(b); } finally{ w.releaseLock(); } } else await USB.dev.transferOut(USB.epOut,b); }
 const SLCAN_SPEED={10000:"S0",20000:"S1",50000:"S2",100000:"S3",125000:"S4",250000:"S5",500000:"S6",800000:"S7",1000000:"S8"};
 function parseSlcan(line){ // t iii l dd.. | T iiiiiiii l dd.. (r/R = remote, no data)
   const c=line[0]; if(!"tTrR".includes(c)) return null;
@@ -892,7 +918,7 @@ async function usbCapture(){
     setUsb("on","Listening at "+rate/1000+" kbit/s (listen-only)");
     let buf="";
     while(!USB.stop && (secs===0 || performance.now()-t0 < secs*1000)){
-      const r=await Promise.race([USB.dev.transferIn(USB.epIn, USB.kind==="gs_usb"?64*20:512), sleep(1000).then(()=>null)]);
+      USB.pend=USB.pend||usbRead(USB.kind==="gs_usb"?64*20:512); const r=await Promise.race([USB.pend, sleep(1000).then(()=>null)]); if(r) USB.pend=null; // keep one read waiting so no data is dropped
       if(r && r.data && r.data.byteLength){
         if(USB.kind==="gs_usb"){ for(let o=0;o+20<=r.data.byteLength;o+=20) add(parseGs(r.data,o)); }
         else { buf+=new TextDecoder().decode(r.data); const parts=buf.split("\r"); buf=parts.pop(); parts.forEach(l=>add(parseSlcan(l.trim()))); }
@@ -910,6 +936,8 @@ async function usbCapture(){
   $("btnUsbCapture").disabled=false; $("btnUsbStop").disabled=true; $("btnUsbConnect").disabled=false;
   exportsOn(true);
 }
+$("btnUsbSerial").onclick=async()=>{ try{ setUsb("busy","Connecting (serial)…"); const name=await serialConnect(); setUsb("on","Connected: "+name); $("btnUsbCapture").disabled=false; }catch(err){ setUsb("err",String(err.message||err)); } };
+if(!("serial" in navigator)) $("btnUsbSerial").style.display="none";
 $("btnUsbConnect").onclick=async()=>{ try{ setUsb("busy","Connecting…"); const name=await usbConnect(); setUsb("on","Connected: "+name); $("btnUsbCapture").disabled=false; }catch(err){ setUsb("err",String(err.message||err)); } };
 $("btnUsbCapture").onclick=usbCapture;
 $("btnUsbStop").onclick=()=>{ USB.stop=true; };
