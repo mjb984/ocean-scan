@@ -84,7 +84,7 @@ details summary { cursor: pointer; font-weight: 600 }
   <header>
     <h1>Ocean Scan</h1>
     <p class="sub">Read-only scanner for the Fisker Ocean with a vLinker FD+. It never clears codes, resets modules or writes anything.</p>
-    <p class="small">Version 8.1 · 2026-11-24 · helper with home AI; read-only checks, plus owner-approved reset and clear for one module at a time</p>
+    <p class="small">Version 8.2 · 2026-11-24 · helper with home AI; read-only checks, plus owner-approved reset and clear for one module at a time</p>
   </header>
 
   <div id="noBt" class="note bad" hidden>
@@ -992,6 +992,8 @@ function saveQueue(q){
   catch(_){ memQ=k; try{ localStorage.setItem("os.queue", JSON.stringify(k.filter(it=>it.body.length<500000))); }catch(__){} } // too big for phone storage: keep in memory and send now
 }
 function queueUpload(r){
+  if(!serverMode && r.can && Array.isArray(r.can.log)){ // project rule: raw CAN captures stay at home, not on GitHub
+    r=JSON.parse(JSON.stringify(r)); r.can.log_frames=r.can.log.length; r.can.log="not uploaded to GitHub: open the app from the home server (Tailscale link) to keep raw captures, or use Save"; }
   const path=scanPath(r), body=JSON.stringify(r,null,2);
   if(uploadedTimes.has(path+"|"+body.length)) return;          // same result already sent
   const q=loadQueue().filter(it=>it.path!==path);              // newer copy of the same file replaces the older one
