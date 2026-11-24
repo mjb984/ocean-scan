@@ -84,7 +84,7 @@ details summary { cursor: pointer; font-weight: 600 }
   <header>
     <h1>Ocean Scan</h1>
     <p class="sub">Read-only scanner for the Fisker Ocean with a vLinker FD+. It never clears codes, resets modules or writes anything.</p>
-    <p class="small">Version 8 · 2026-11-24 · helper with home AI; read-only checks, plus owner-approved reset and clear for one module at a time</p>
+    <p class="small">Version 8.1 · 2026-11-24 · helper with home AI; read-only checks, plus owner-approved reset and clear for one module at a time</p>
   </header>
 
   <div id="noBt" class="note bad" hidden>
@@ -852,7 +852,7 @@ setInterval(svcCheck, 1000);
 // Safety: the adapter is always opened LISTEN-ONLY. No transmit command exists in this code.
 const USB = { dev:null, kind:null, epIn:null, epOut:null, iface:null, stop:false };
 const GS = { HOST_FORMAT:0, BITTIMING:1, MODE:2, BT_CONST:4, MODE_RESET:0, MODE_START:1, FLAG_LISTEN_ONLY:1 };
-const SLCAN_ALLOWED=/^(C|S[0-8]|L|V|v)$/;
+const SLCAN_ALLOWED=/^(C|S[0-8]|L|V|v|M1|O)$/; // O only ever follows a successful-looking M1 (silent) on CANable firmware
 function setUsb(kind,text){ $("usbDot").className="dot "+(kind||""); $("usbText").textContent=text; }
 async function claimWithRetry(dev, n){
   try{ await dev.claimInterface(n); return; }catch(e1){
@@ -921,6 +921,21 @@ function parseSlcan(line){ // t iii l dd.. | T iiiiiiii l dd.. (r/R = remote, no
 function parseGs(dv,off){ const raw=dv.getUint32(off+4,true), dlc=dv.getUint8(off+8); const ext=!!(raw&0x80000000), id=raw&(ext?0x1FFFFFFF:0x7FF);
   if(dv.getUint32(off,true)!==0xFFFFFFFF) return null; // echo of our own transmit (never happens: we never transmit)
   let d=""; for(let i=0;i<Math.min(dlc,8);i++) d+=dv.getUint8(off+12+i).toString(16).padStart(2,"0").toUpperCase(); return {id,ext,dlc,data:d,err:!!(raw&0x20000000)}; }
+// Read whatever the adapter sends for up to ms (used only before listening starts).
+async function slcanReply(ms){ let txt=""; const end=Date.now()+ms;
+  while(Date.now()<end){ USB.pend=USB.pend||usbRead(512); const r=await Promise.race([USB.pend, sleep(Math.max(1,end-Date.now())).then(()=>null)]);
+    if(!r) break; USB.pend=null; if(r.data&&r.data.byteLength) txt+=new TextDecoder().decode(r.data); if(/\r/.test(txt)) break; }
+  return txt; }
+// Listen-only open. CANable firmware (normaldotcom canable-fw / canable2-fw) has no "L": its silent mode is "M1",
+// set while the channel is closed, then "O". Other LAWICEL adapters use "L". We ask the firmware its version first.
+async function slcanOpenListen(rate){
+  await slcanCmd("C").catch(()=>{}); await slcanReply(300);
+  await slcanCmd("V"); const ver=(await slcanReply(800)).replace(/[\r\x07]/g," ").trim(); USB.fw=ver||"(no version reply)";
+  await slcanCmd(SLCAN_SPEED[rate]);
+  if(/canable/i.test(ver)){ await slcanCmd("M1"); await sleep(50); await slcanCmd("O"); USB.openCmd="M1 + O (CANable silent mode)"; }
+  else { await slcanCmd("L"); USB.openCmd="L (LAWICEL listen-only)"; }
+  log("USB CAN firmware: "+USB.fw+" · opened with "+USB.openCmd);
+}
 async function usbCapture(){
   const rate=parseInt($("usbRate").value,10), secs=parseInt($("usbSecs").value,10);
   USB.stop=false; $("btnUsbCapture").disabled=true; $("btnUsbStop").disabled=false; $("btnUsbConnect").disabled=true;
@@ -930,8 +945,8 @@ async function usbCapture(){
     const key=(f.ext?f.id.toString(16).padStart(8,"0"):f.id.toString(16).padStart(3,"0")).toUpperCase(); const e=cap.can.ids[key]||(cap.can.ids[key]={count:0,dlc:f.dlc,last:""}); e.count++; e.last=f.data;
     if(cap.can.log.length<MAXLOG) cap.can.log.push("("+((performance.now()-t0)/1000).toFixed(6)+") can0 "+key+"#"+f.data); };
   try{
-    if(USB.kind==="gs_usb") await gsStart(rate); else { await slcanCmd("C").catch(()=>{}); await slcanCmd(SLCAN_SPEED[rate]); await slcanCmd("L"); }
-    setUsb("on","Listening at "+rate/1000+" kbit/s (listen-only)");
+    if(USB.kind==="gs_usb") await gsStart(rate); else { await slcanOpenListen(rate); }
+    setUsb("on","Listening at "+rate/1000+" kbit/s (listen-only"+(USB.openCmd?", "+USB.openCmd:"")+")"); if(USB.kind==="slcan"){ cap.can.firmware_version=USB.fw; cap.can.open_command=USB.openCmd; }
     let buf="";
     while(!USB.stop && (secs===0 || performance.now()-t0 < secs*1000)){
       USB.pend=USB.pend||usbRead(USB.kind==="gs_usb"?64*20:512); const r=await Promise.race([USB.pend, sleep(1000).then(()=>null)]); if(r) USB.pend=null; // keep one read waiting so no data is dropped
