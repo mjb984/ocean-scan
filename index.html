@@ -84,12 +84,28 @@ details summary { cursor: pointer; font-weight: 600 }
   <header>
     <h1>Ocean Scan</h1>
     <p class="sub">Read-only scanner for the Fisker Ocean with a vLinker FD+. It never clears codes, resets modules or writes anything.</p>
-    <p class="small">Version 7.1 · 2026-11-24 · read-only checks, plus owner-approved reset and clear for one module at a time</p>
+    <p class="small">Version 8 · 2026-11-24 · helper with home AI; read-only checks, plus owner-approved reset and clear for one module at a time</p>
   </header>
 
   <div id="noBt" class="note bad" hidden>
     This browser can't use Bluetooth. Open this page in <b>Chrome on Android</b> (iPhone browsers can't do this), loaded from an <b>https://</b> address.
   </div>
+
+  <section aria-labelledby="h-ai" id="aiSec">
+    <h2 id="h-ai">Helper: what to do next</h2>
+    <p id="aiCoach" style="font-size:1.05em;margin:4px 0 8px"><b>Step 1.</b> Plug the vLinker into the car, press the brake, then tap <b>Connect vLinker</b>.</p>
+    <div id="aiBox" hidden>
+      <label for="aiAsk">Ask the home AI (sees everything on this page)
+        <input id="aiAsk" autocomplete="off" placeholder="e.g. why 0 frames? / what should I check for no sound?">
+      </label>
+      <div class="row" style="margin-top:8px">
+        <button id="btnAi">Ask</button>
+        <label style="display:flex;gap:6px;align-items:center"><input type="checkbox" id="aiAuto" style="width:auto"> Let it run read-only steps for me</label>
+      </div>
+      <p id="aiAnswer" class="small" style="margin-top:8px"></p>
+    </div>
+    <p id="aiNoServer" class="small">The home AI works when this app is opened from your home server (Tailscale link). These tips work anywhere.</p>
+  </section>
 
   <section aria-labelledby="h-conn">
     <h2 id="h-conn">1 · Connect</h2>
@@ -1090,6 +1106,65 @@ $("btnStop").onclick=()=>{ stopFlag=true; $("progress").textContent="Stopping af
 $("btnBtInfo").onclick=()=>{ log("[bt] device: "+(BT.device&&BT.device.name)); BT.services.forEach(s=>{ log("[bt] service "+s.uuid); s.chars.forEach(c=>log("[bt]    "+c.uuid+"  "+c.props.join(","))); }); };
 if("serviceWorker" in navigator && location.protocol==="https:"){ navigator.serviceWorker.register("sw.js").catch(()=>{}); }
 if(!("bluetooth" in navigator)){ $("noBt").hidden=false; $("btnConnect").disabled=true; }
+
+// ---------------------------------------------------------------- Helper (coach + home AI)
+// Coach: fixed rules, runs on the phone, no server. Home AI: /api/assist on the home server (local model).
+// The AI can only press read-only buttons below, at most AI_MAX_AUTO times per page load. Never service actions.
+const AI_ACTIONS={scan_sound:"btnSound", scan_full:"btnFull", fault_details:"btnDetails", car_readings:"btnCar", volts:"btnVolts", obd_check:"btnObd", can_listen:"btnUsbCapture"};
+const AI_MAX_AUTO=6; let aiAutoCount=0, aiBusy=false, aiLastKey="";
+function aiState(){
+  const r=report||{}, c=r.can||null, ls=lastScan;
+  const mods = ls ? Object.entries(ls.modules||{}) : [];
+  return { vlinker_connected: !!BT.writeChar, busy: !!ELM.busy, usb_adapter: USB.name||null, usb_connected: !!(USB.dev||USB.port),
+    current: r.kind||null, progress: ($("progress")||{}).textContent||"", usb_progress: ($("usbProgress")||{}).textContent||"",
+    can: c ? {status:c.status||"running", bitrate:c.bitrate, frames:c.frames, error_frames:c.error_frames, ids:Object.keys(c.ids||{}).slice(0,40)} : null,
+    last_scan: ls ? { time:ls.time, kind:ls.kind, car_state:ls.car_state, volts:ls.adapter_volts_start,
+      silent: mods.filter(([,m])=>!m.answered).map(([n])=>n),
+      codes: mods.filter(([,m])=>Array.isArray(m.dtcs)&&m.dtcs.length).map(([n,m])=>({module:n, active:m.dtcs.filter(d=>d.active).length, total:m.dtcs.length, first:m.dtcs.slice(0,5).map(d=>d.code+(d.desc?" "+d.desc:""))})) } : null };
+}
+function aiCoach(){
+  const st=aiState(), c=st.can;
+  if(c && c.status==="running"){
+    if(c.error_frames>0) return "<b>Error frames.</b> Usually the speed is wrong or CANH/CANL are swapped. Stop, swap the two wires, listen again.";
+    if(c.frames===0) return "<b>Listening, nothing heard yet.</b> Check wires: OBD pin 6 → CANH, pin 14 → CANL, pin 5 → GND, nothing on 16. The port may stay quiet until asked: connect the vLinker too (Y-splitter) and tap <b>Sound + power</b> while this listens.";
+    return "<b>Hearing the car: "+c.frames+" frames.</b> Wiring is good. Let it finish; it saves by itself.";
+  }
+  if(c && c.status && c.status!=="running") return c.frames ? "<b>Capture saved ("+c.frames+" frames).</b> I'll read it from the home server." : "<b>Capture heard nothing.</b> Swap CANH and CANL, check pin 5 → GND, and run a vLinker scan at the same time.";
+  if(st.busy) return "<b>Working…</b> Keep the phone near the car and the screen on.";
+  if(!st.vlinker_connected && !st.usb_connected) return "<b>Step 1.</b> Plug the vLinker into the car, press the brake, then tap <b>Connect vLinker</b>.";
+  if(st.vlinker_connected && !st.last_scan) return "<b>Step 2.</b> Pick the car state, then tap <b>Full scan</b> (about 2 minutes).";
+  if(st.last_scan){ const v=st.last_scan.volts;
+    if(v!==null && v!==undefined && v<12.2) return "<b>12V is low ("+v+" V).</b> Charge or connect the car to power before anything else.";
+    const sil=st.last_scan.silent, n=st.last_scan.codes.reduce((a,x)=>a+x.active,0);
+    return "<b>Scan saved.</b> "+(sil.length?"Silent: "+esc(sil.join(", "))+" (power, fuse or plug problem, not software). ":"")+(n?n+" active codes. Tap <b>Fault details</b> next.":"No active codes.");
+  }
+  if(st.usb_connected) return "<b>USB adapter ready.</b> Wire it to the car, press the brake, tap <b>Start listening</b>.";
+  return "";
+}
+function aiTick(){ const h=aiCoach(); if(h && $("aiCoach").innerHTML!==h) $("aiCoach").innerHTML=h; }
+async function aiAsk(question, auto){
+  if(aiBusy || !serverMode) return; aiBusy=true; $("btnAi").disabled=true; $("aiAnswer").textContent="Thinking… (home AI)";
+  try{
+    const r=await fetch("api/assist",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({question:question||"What should I do next?", state:aiState()})});
+    const a=await r.json(); if(!r.ok) throw new Error(a.error||("HTTP "+r.status));
+    let txt=a.say||"(no answer)"; const btn=AI_ACTIONS[a.action];
+    if(btn && $(btn) && !$(btn).disabled){
+      if($("aiAuto").checked && aiAutoCount<AI_MAX_AUTO){ aiAutoCount++; txt+=" → Running: "+a.action.replace("_"," ")+"."; setTimeout(()=>$(btn).click(),500); }
+      else txt+=" → Suggested: tap "+($(btn).textContent||a.action)+".";
+    }
+    $("aiAnswer").textContent=txt+(a.source?" ("+a.source+")":"");
+  }catch(err){ $("aiAnswer").textContent="Home AI didn't answer ("+(err.message||err)+"). The tip above still applies."; }
+  aiBusy=false; $("btnAi").disabled=false;
+}
+// When a job finishes and auto is on, ask once what's next (bounded by AI_MAX_AUTO).
+function aiOnIdle(){ if(!$("aiAuto").checked || !serverMode || ELM.busy || aiBusy) return;
+  const key=(report&&report.time||"")+"|"+((report&&report.can&&report.can.status)||"")+"|"+(lastScan&&lastScan.time||"");
+  if(key===aiLastKey || !report) return; aiLastKey=key; if(report.can && report.can.status==="running") return;
+  if(aiAutoCount<AI_MAX_AUTO) aiAsk("A step just finished. What next?", true); }
+$("btnAi").onclick=()=>{ const q=$("aiAsk").value.trim(); aiAsk(q); };
+$("aiAsk").addEventListener("keydown",e=>{ if(e.key==="Enter") $("btnAi").click(); });
+setInterval(()=>{ aiTick(); aiOnIdle(); }, 1500);
+detectServer().then(on=>{ if(on){ fetch("api/health").then(r=>r.json()).then(h=>{ if(h.assistant){ $("aiBox").hidden=false; $("aiNoServer").hidden=true; } }).catch(()=>{}); } });
 </script>
 </body>
 </html>
