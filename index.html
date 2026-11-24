@@ -51,6 +51,8 @@ button { font: 600 .95rem var(--sans); border-radius: 8px; border: 1px solid var
   padding: 11px 14px; min-height: 44px; cursor: pointer }
 button.primary { background: var(--accent); color: var(--accent-fg); border-color: var(--accent) }
 button:disabled { opacity: .45; cursor: not-allowed }
+button .bh { display:block; font-weight:400; font-size:.78rem; opacity:.8; margin-top:2px; text-align:left }
+#gStep { font-size:1.5rem; font-weight:700; margin:8px 0; min-height:2.2em }
 button:focus-visible, input:focus-visible, select:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px }
 label { font-size: .85rem; color: var(--muted); display: grid; gap: 4px; flex: 1 1 220px; min-width: 0 }
 input, select { font: .95rem var(--sans); padding: 10px; border-radius: 8px; border: 1px solid var(--line); background: var(--bg); color: var(--fg); width: 100% }
@@ -84,7 +86,7 @@ details summary { cursor: pointer; font-weight: 600 }
   <header>
     <h1>Ocean Scan</h1>
     <p class="sub">Read-only scanner for the Fisker Ocean with a vLinker FD+. It never clears codes, resets modules or writes anything.</p>
-    <p class="small">Version 8.2 · 2026-11-24 · helper with home AI; read-only checks, plus owner-approved reset and clear for one module at a time</p>
+    <p class="small">Version 9 · 2026-11-24 · guided capture, keeps screen on, helper with home AI; read-only checks, plus owner-approved reset and clear for one module at a time</p>
   </header>
 
   <div id="noBt" class="note bad" hidden>
@@ -217,6 +219,7 @@ details summary { cursor: pointer; font-weight: 600 }
 
   <section aria-labelledby="h-usb">
     <h2 id="h-usb">USB CAN adapter (listen-only)</h2>
+    <p class="note" style="margin-bottom:8px"><b>Keep this page open and on screen while recording.</b> The app keeps the screen awake by itself and saves every 20 seconds. If you switch apps or lock the phone, Android pauses the page and recording stops for that time.</p>
     <p class="small" style="margin-bottom:8px">For a CANable-type adapter plugged into this phone or tablet's USB-C port (OTG adapter if needed), wired to the car as in the CAN adapter guide. It only listens: the adapter is opened in listen-only mode, so it never sends anything, not even acknowledgements. Chrome on Android only.</p>
     <div class="row" style="margin-bottom:8px"><div class="status"><span id="usbDot" class="dot"></span><span id="usbText">Not connected</span></div></div>
     <div class="row">
@@ -233,6 +236,16 @@ details summary { cursor: pointer; font-weight: 600 }
       <button id="btnUsbCapture" disabled>Start listening</button>
       <button id="btnUsbStop" disabled>Stop</button>
     </div>
+    <details id="gBox" style="margin-top:12px">
+      <summary><b>Guided capture</b>: the app tells you what to do, and marks it in the recording</summary>
+      <div class="note" style="margin:10px 0">Parked only: car in Park, in Ready, nobody driving. The phone reads each step out loud, waits, records, then moves on. Listen-only, like the rest of this section. Connect the USB adapter first.</div>
+      <label for="gRoutine">Routine
+        <select id="gRoutine"></select>
+      </label>
+      <div id="gStep" aria-live="assertive">Ready when you are.</div>
+      <p id="gInfo" class="small"></p>
+      <div class="row"><button id="btnGuided" class="primary" disabled>Start guided capture<span class="bh">About 3 minutes. Turn up the phone volume.</span></button><button id="btnGuidedStop" disabled>Stop</button></div>
+    </details>
     <p id="usbProgress" class="small" style="margin-top:8px">Works with candleLight firmware (shows as gs_usb) and slcan firmware. Nothing is sent on the car's network.</p>
   </section>
 
@@ -474,7 +487,7 @@ function enable(on){
   $("btnDisconnect").disabled=!on; $("btnConnect").disabled=on;
 }
 function running(on){
-  ELM.busy=on; ACTION_BTNS.concat(["btnDisconnect"]).forEach(id=>$(id).disabled=on); $("btnDetails").disabled=on||!hasCodes(); $("btnStop").disabled=!on;
+  ELM.busy=on; try{ keepAwake(on || !!(USB.cap && USB.cap.can && !USB.cap.can.status)); }catch(_){} ACTION_BTNS.concat(["btnDisconnect"]).forEach(id=>$(id).disabled=on); $("btnDetails").disabled=on||!hasCodes(); $("btnStop").disabled=!on;
 }
 function esc(s){ return String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
 
@@ -937,10 +950,11 @@ async function slcanOpenListen(rate){
   log("USB CAN firmware: "+USB.fw+" · opened with "+USB.openCmd);
 }
 async function usbCapture(){
-  const rate=parseInt($("usbRate").value,10), secs=parseInt($("usbSecs").value,10);
+  const rate=parseInt($("usbRate").value,10), secs=USB.guided?0:parseInt($("usbSecs").value,10);
   USB.stop=false; $("btnUsbCapture").disabled=true; $("btnUsbStop").disabled=false; $("btnUsbConnect").disabled=true;
-  const cap=newReport("can capture"); cap.can={adapter:USB.name, firmware:USB.kind, bitrate:rate, listen_only:true, seconds:secs||"until stop", frames:0, error_frames:0, ids:{}, log:[]};
-  report=cap; const t0=performance.now(); let lastLive=Date.now(), lastSave=Date.now(), lastIds=0; const MAXLOG=60000; // about 2 MB of log; counts per ID keep going after that
+  const cap=newReport("can capture"); cap.can={adapter:USB.name, firmware:USB.kind, bitrate:rate, listen_only:true, seconds:secs||"until stop", frames:0, error_frames:0, ids:{}, log:[], markers:[]};
+  if(USB.guided) cap.kind="can capture guided", cap.can.routine=USB.guided;
+  report=cap; const t0=performance.now(); USB.t0=t0; USB.cap=cap; await keepAwake(true); let lastLive=Date.now(), lastSave=Date.now(), lastIds=0; const MAXLOG=60000; // about 2 MB of log; counts per ID keep going after that
   const add=f=>{ if(!f) return; if(f.err){ cap.can.error_frames++; return; } cap.can.frames++;
     const key=(f.ext?f.id.toString(16).padStart(8,"0"):f.id.toString(16).padStart(3,"0")).toUpperCase(); const e=cap.can.ids[key]||(cap.can.ids[key]={count:0,dlc:f.dlc,last:""}); e.count++; e.last=f.data;
     if(cap.can.log.length<MAXLOG) cap.can.log.push("("+((performance.now()-t0)/1000).toFixed(6)+") can0 "+key+"#"+f.data); };
@@ -957,12 +971,13 @@ async function usbCapture(){
       const el=(performance.now()-t0)/1000;
       $("usbProgress").textContent="Listening "+Math.round(el)+" s"+(secs?" of "+secs:"")+": "+cap.can.frames+" frames from "+Object.keys(cap.can.ids).length+" IDs"+(cap.can.error_frames?", "+cap.can.error_frames+" error frames (wrong speed or wiring?)":"")+". Nothing is sent to the car.";
       if(Date.now()-lastLive>2000){ lastLive=Date.now(); const n=Object.keys(cap.can.ids).length; live({type:"can", seconds:Math.round(el), frames:cap.can.frames, ids:n, new_ids:n-lastIds, error_frames:cap.can.error_frames}); lastIds=n; }
-      if(Date.now()-lastSave>60000){ lastSave=Date.now(); cap.can.status="running"; queueUpload(cap); }
+      if(Date.now()-lastSave>20000 || USB.saveNow){ USB.saveNow=false; lastSave=Date.now(); cap.can.status="running"; queueUpload(cap); }
     }
     cap.can.status=USB.stop?"stopped by you":"done";
     $("usbProgress").innerHTML="<b>Done.</b> "+cap.can.frames+" frames from "+Object.keys(cap.can.ids).length+" IDs saved"+(cap.can.frames?"":". Nothing heard: check wiring (pins 6 and 14), try another speed, or the port may be quiet")+".";
   }catch(err){ cap.can.status="failed: "+(err.message||err); $("usbProgress").innerHTML="<b>Failed:</b> "+esc(err.message||err)+(cap.can.frames?". The "+cap.can.frames+" frames heard so far are saved.":""); }
   try{ if(USB.kind==="gs_usb") await gsStop(); else await slcanCmd("C"); }catch(_){}
+  keepAwake(false);
   setUsb("on","Connected: "+USB.name);
   $("btnUsbCapture").disabled=false; $("btnUsbStop").disabled=true; $("btnUsbConnect").disabled=false;
   exportsOn(true);
@@ -1182,6 +1197,100 @@ $("btnAi").onclick=()=>{ const q=$("aiAsk").value.trim(); aiAsk(q); };
 $("aiAsk").addEventListener("keydown",e=>{ if(e.key==="Enter") $("btnAi").click(); });
 setInterval(()=>{ aiTick(); aiOnIdle(); }, 1500);
 detectServer().then(on=>{ if(on){ fetch("api/health").then(r=>r.json()).then(h=>{ if(h.assistant){ $("aiBox").hidden=false; $("aiNoServer").hidden=true; } }).catch(()=>{}); } });
+
+// ---------------------------------------------------------------- Friendlier buttons: a short line under each
+const BTN_HINTS={ btnConnect:"Plug the vLinker in, press the brake, then tap.", btnFull:"Every module: codes and versions. About 2 minutes.",
+  btnSound:"Only the modules for sound and power. About 30 seconds.", btnDetails:"More about each code: when and how it happened.",
+  btnCar:"What the car itself measures.", btnVolts:"Writes the 12V down every few seconds.", btnObd:"The standard emissions check any car answers.",
+  btnListen:"Is the OBD port talking? Uses the vLinker.", btnUsbConnect:"The CANable plugged into the phone.", btnUsbSerial:"Use this if the button to the left fails.",
+  btnUsbCapture:"Records what the car says. Never sends anything.", btnShare:"Send the result to another app.", btnSave:"Keep a copy on this phone." };
+for(const [id,h] of Object.entries(BTN_HINTS)){ const b=$(id); if(b && !b.querySelector(".bh")) b.insertAdjacentHTML("beforeend",'<span class="bh">'+h+'</span>'); }
+
+// ---------------------------------------------------------------- Guided capture (parked, listen-only)
+// One continuous capture; each step adds a marker {t, step, phase} on the capture's own clock, so the home AI
+// can compare "during the step" against the quiet baseline and find which ID/byte reacted.
+const ROUTINES = {
+  controls: { name:"Controls, parked (about 3 min)", steps:[
+    ["baseline","Sit still. Don't touch anything.",15],
+    ["brake","Press the brake pedal hard, and hold it.",6],
+    ["brake_release","Let go of the brake.",5],
+    ["steer_left","Turn the steering wheel all the way left.",6],
+    ["steer_center1","Bring the wheel back to the middle.",5],
+    ["steer_right","Turn the steering wheel all the way right.",6],
+    ["steer_center2","Back to the middle.",5],
+    ["signal_left","Left turn signal on.",6],
+    ["signal_left_off","Turn signal off.",4],
+    ["signal_right","Right turn signal on.",6],
+    ["signal_right_off","Turn signal off.",4],
+    ["hazards","Hazard lights on.",6],
+    ["hazards_off","Hazard lights off.",4],
+    ["driver_door","Open the driver door, then close it.",8],
+    ["horn","Short tap on the horn.",4],
+    ["end_baseline","Sit still again.",10] ] },
+  pedals: { name:"Pedals and gear, parked (about 1.5 min)", steps:[
+    ["baseline","Sit still. Foot on the brake.",10],
+    ["brake_light","Press the brake lightly.",5],
+    ["brake_hard","Now press it hard.",5],
+    ["brake_release","Let go of the brake.",5],
+    ["gear_r","Foot on the brake. Shift to Reverse.",6],
+    ["gear_n","Shift to Neutral.",6],
+    ["gear_d","Shift to Drive. Keep your foot on the brake.",6],
+    ["gear_p","Shift back to Park.",6],
+    ["end_baseline","Sit still.",10] ] },
+  audio: { name:"Sound and screen (about 1.5 min)", steps:[
+    ["baseline","Sit still.",10],
+    ["vol_up","Turn the volume up with the steering wheel.",6],
+    ["vol_down","Turn the volume down.",6],
+    ["media_play","Start music or the radio on the screen.",8],
+    ["media_stop","Stop the music.",6],
+    ["climate_temp","Change the cabin temperature on the screen.",8],
+    ["rear_climate","Touch the rear climate panel buttons.",8],
+    ["end_baseline","Sit still.",10] ] }
+};
+$("gRoutine").innerHTML=Object.entries(ROUTINES).map(([k,r])=>'<option value="'+k+'">'+r.name+'</option>').join("");
+let gStopFlag=false;
+function say(t){ try{ speechSynthesis.cancel(); const u=new SpeechSynthesisUtterance(t); u.rate=0.95; speechSynthesis.speak(u); }catch(_){ } }
+function gMark(step,phase){ const c=USB.cap; if(!c||!c.can) return; const t=+((performance.now()-USB.t0)/1000).toFixed(3);
+  c.can.markers.push({t,step,phase}); live({type:"can marker", step, phase, t}); }
+async function gWait(sec){ const end=Date.now()+sec*1000; while(Date.now()<end){ if(gStopFlag||USB.stop) throw new Error("stopped"); await sleep(200); } }
+async function runGuided(){
+  const key=$("gRoutine").value, R=ROUTINES[key]; gStopFlag=false; USB.guided=key;
+  $("btnGuided").disabled=true; $("btnGuidedStop").disabled=false;
+  const capP=usbCapture(); await sleep(1200);
+  try{
+    if(!USB.cap || USB.cap.can.status) throw new Error("the adapter didn't start listening");
+    say("Guided capture. "+R.steps.length+" steps. Car in Park."); $("gStep").textContent="Starting…"; await gWait(4);
+    for(let i=0;i<R.steps.length;i++){
+      const [id,text,secs]=R.steps[i];
+      $("gStep").textContent="Next: "+text; $("gInfo").textContent="Step "+(i+1)+" of "+R.steps.length+" · get ready";
+      say("Next. "+text); await gWait(4);
+      $("gStep").textContent="NOW: "+text; say("Now."); gMark(id,"start");
+      for(let k=secs;k>0;k--){ $("gInfo").textContent="Step "+(i+1)+" of "+R.steps.length+" · recording "+k+" s"; await gWait(1); }
+      gMark(id,"end"); say("Stop."); $("gStep").textContent="Stop. Relax."; await gWait(2);
+    }
+    $("gStep").textContent="Done. Saving…"; say("All done. Thank you.");
+  }catch(err){ $("gStep").textContent="Stopped"+(err.message&&err.message!=="stopped"?": "+err.message:"")+". What was recorded is saved."; }
+  USB.stop=true; await capP; USB.guided=null; USB.cap=null;
+  $("btnGuided").disabled=false; $("btnGuidedStop").disabled=true;
+  $("gInfo").textContent="Saved with "+((report&&report.can&&report.can.markers.length)||0)+" step marks. The home AI compares each step with the quiet parts.";
+}
+$("btnGuided").onclick=runGuided; $("btnGuidedStop").onclick=()=>{ gStopFlag=true; };
+setInterval(()=>{ const ready=!!(USB.dev||USB.port) && !USB.guided && $("btnUsbCapture") && !$("btnUsbCapture").disabled; if(!USB.guided) $("btnGuided").disabled=!ready; }, 1000);
+
+// ---------------------------------------------------------------- Keep recording: screen on, save often, warn when hidden
+// A web page can't record with the screen off or in the background (Android pauses it). So: hold a screen wake lock
+// while recording, save a copy every 20 s (and the moment the page is hidden), and warn loudly.
+let wakeLock=null, wakeWanted=false;
+async function keepAwake(on){ wakeWanted=on;
+  try{ if(on && !wakeLock && "wakeLock" in navigator){ wakeLock=await navigator.wakeLock.request("screen"); wakeLock.addEventListener("release",()=>{ wakeLock=null; }); }
+       if(!on && wakeLock){ await wakeLock.release(); wakeLock=null; } }catch(_){ } }
+function recording(){ return !!(USB.cap && USB.cap.can && !USB.cap.can.status) || !!ELM.busy; }
+document.addEventListener("visibilitychange",()=>{
+  if(document.visibilityState==="hidden"){ if(USB.cap && USB.cap.can && !USB.cap.can.status){ USB.saveNow=true; USB.cap.can.paused_at=USB.cap.can.paused_at||[]; USB.cap.can.paused_at.push(+((performance.now()-USB.t0)/1000).toFixed(1)); queueUpload(USB.cap); } }
+  else { if(wakeWanted) keepAwake(true);
+    if(USB.cap && USB.cap.can && !USB.cap.can.status){ $("usbProgress").insertAdjacentHTML("afterbegin","<b>The page was hidden; recording paused for that time.</b> Keep this page open and on screen. "); try{ say("Recording was paused. Keep this page open."); }catch(_){} } }
+});
+window.addEventListener("beforeunload",e=>{ if(recording()){ e.preventDefault(); e.returnValue=""; } });
 </script>
 </body>
 </html>
