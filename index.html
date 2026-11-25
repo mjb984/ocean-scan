@@ -86,7 +86,7 @@ details summary { cursor: pointer; font-weight: 600 }
   <header>
     <h1>Ocean Scan</h1>
     <p class="sub">Read-only scanner for the Fisker Ocean with a vLinker FD+. It never clears codes, resets modules or writes anything.</p>
-    <p class="small">Version 9 · 2026-11-24 · guided capture, keeps screen on, helper with home AI; read-only checks, plus owner-approved reset and clear for one module at a time</p>
+    <p class="small">Version 9.1 · 2026-11-25 · guided capture, keeps screen on, helper with home AI; read-only checks, plus owner-approved reset and clear for one module at a time</p>
   </header>
 
   <div id="noBt" class="note bad" hidden>
@@ -793,7 +793,8 @@ const SVC_NO_RESET = new Set(["VCU"]); // drive controller: clear codes only, ne
 function guardService(name, p){
   if(SVC_LOCKED.has(name)) throw new Error("Safety stop: "+name+" is locked out of service actions");
   if(SVC_NO_RESET.has(name) && p[0]===0x11) throw new Error("Safety stop: "+name+" can't be reset from here, only its codes cleared");
-  const okP = Object.values(SVC_ACTIONS).some(a=>a.payload.length===p.length && a.payload.every((b,i)=>b===p[i]));
+  const SESS=[[0x10,0x03],[0x10,0x01]]; // extended / default diagnostic session only (never 10 02 programming)
+  const okP = Object.values(SVC_ACTIONS).concat(SESS.map(x=>({payload:x}))).some(a=>a.payload.length===p.length && a.payload.every((b,i)=>b===p[i]));
   if(!okP) throw new Error("Safety stop: service request "+hex(p)+" is not allowed");
 }
 async function udsService(name, tx, payload){
@@ -804,6 +805,22 @@ async function udsService(name, tx, payload){
   for(let n=0; r && r.length>=3 && r[0]===0x7F && r[2]===0x78 && n<5; n++){ // response pending: wait, don't resend a change
     await sleep(1500); try{ const more=await readPrompt(3000); r=pickResponse(parseIsotp(more.split(/[\r\n]+/),tx+8)); }catch(_){ break; }
   }
+  // "not in this session" (NRC 7F/7E): open the extended diagnostic session (10 03) and try once more, then back to default.
+  if(r && r.length>=3 && r[0]===0x7F && (r[2]===0x7F || r[2]===0x7E)){
+    const sresp=await udsService1(name, tx, [0x10,0x03]);
+    if(sresp && sresp[0]===0x50){ USB_SVC_NOTE="opened extended session (10 03) first";
+      const r2=await udsService1(name, tx, payload);
+      if(payload[0]!==0x11){ try{ await udsService1(name, tx, [0x10,0x01]); }catch(_){} }
+      return r2; }
+  }
+  return r;
+}
+let USB_SVC_NOTE="";
+async function udsService1(name, tx, payload){
+  guardService(name, payload);
+  const line=hex(payload).replace(/ /g,"");
+  let r=pickResponse(parseIsotp(await raw(line,5000),tx+8));
+  for(let n=0; r && r.length>=3 && r[0]===0x7F && r[2]===0x78 && n<5; n++){ await sleep(1500); try{ const more=await readPrompt(3000); r=pickResponse(parseIsotp(more.split(/[\r\n]+/),tx+8)); }catch(_){ break; } }
   return r;
 }
 function svcModules(){ return MODULES.filter(([n])=>!SVC_LOCKED.has(n)).map(([n])=>n); }
@@ -826,7 +843,7 @@ async function runService(){
     const v=await adapterVolts(); rec.adapter_volts_start=v;
     if(v!==null && v<12.0) throw new Error("12V is "+v+" V. Charge it to 12.0 V or more first.");
     say("Sending "+esc(act.label)+" to "+esc(name)+"…");
-    const r=await udsService(name, tx, act.payload);
+    USB_SVC_NOTE=""; const r=await udsService(name, tx, act.payload); if(USB_SVC_NOTE) rec.service.note=USB_SVC_NOTE;
     rec.service.response = r===null?"no answer": hex(r);
     const pending = r && r.length>=3 && r[0]===0x7F && r[2]===0x78;
     if(r===null && act.payload[0]!==0x11) throw new Error(name+" did not answer the command. Nothing changed as far as we can tell.");
