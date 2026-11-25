@@ -86,7 +86,7 @@ details summary { cursor: pointer; font-weight: 600 }
   <header>
     <h1>Ocean Scan</h1>
     <p class="sub">Read-only scanner for the Fisker Ocean with a vLinker FD+. It never clears codes, resets modules or writes anything.</p>
-    <p class="small">Version 9.1 · 2026-11-25 · guided capture, keeps screen on, helper with home AI; read-only checks, plus owner-approved reset and clear for one module at a time</p>
+    <p class="small">Version 9.2 · 2026-11-25 · guided capture, keeps screen on, helper with home AI; read-only checks, plus owner-approved reset and clear for one module at a time</p>
   </header>
 
   <div id="noBt" class="note bad" hidden>
@@ -808,6 +808,7 @@ async function udsService(name, tx, payload){
   // "not in this session" (NRC 7F/7E): open the extended diagnostic session (10 03) and try once more, then back to default.
   if(r && r.length>=3 && r[0]===0x7F && (r[2]===0x7F || r[2]===0x7E)){
     const sresp=await udsService1(name, tx, [0x10,0x03]);
+    USB_SVC_NOTE="tried extended session 10 03: "+(sresp?hex(sresp)+(sresp[0]===0x7F?" ("+describeNeg(sresp)+")":""):"no answer");
     if(sresp && sresp[0]===0x50){ USB_SVC_NOTE="opened extended session (10 03) first";
       const r2=await udsService1(name, tx, payload);
       if(payload[0]!==0x11){ try{ await udsService1(name, tx, [0x10,0x01]); }catch(_){} }
@@ -836,7 +837,7 @@ async function runService(){
   const before=lastScan.modules[name];
   if(!before || !before.answered){ say("<b>Not run.</b> "+esc(name)+" didn't answer in the last scan. A silent module can't take a reset; check its power, fuses and wiring."); return; }
   running(true); stopFlag=false;
-  const rec=newReport("service "+act.label+" "+name); rec.modules={}; rec.service={module:name, action:act.label, request:hex(act.payload), before_scan:lastScan.time, before:{dtcs:before.dtcs, versions:before.versions}};
+  const rec=newReport("service "+act.label+" "+name); rec.modules={}; rec.service={app:"9.2", module:name, action:act.label, request:hex(act.payload), before_scan:lastScan.time, before:{dtcs:before.dtcs, versions:before.versions}};
   report=rec;
   try{
     await elmInit();
@@ -847,7 +848,7 @@ async function runService(){
     rec.service.response = r===null?"no answer": hex(r);
     const pending = r && r.length>=3 && r[0]===0x7F && r[2]===0x78;
     if(r===null && act.payload[0]!==0x11) throw new Error(name+" did not answer the command. Nothing changed as far as we can tell.");
-    if(r && !pending && r[0]===0x7F) throw new Error(name+" "+describeNeg(r)+". Nothing was changed.");
+    if(r && !pending && r[0]===0x7F) throw new Error(name+" "+describeNeg(r)+(USB_SVC_NOTE?" ("+USB_SVC_NOTE+")":"")+". Nothing was changed.");
     if(r && !pending && r[0]!==act.ok) throw new Error("Unexpected answer "+hex(r));
     rec.service.result = (r && !pending) ? "accepted" : "unconfirmed (no final answer; the re-read below shows what happened)";
     say(esc(name)+(rec.service.result==="accepted"?" accepted the ":" gave no final answer to the ")+esc(act.label)+". Waiting 8 seconds, then re-reading it…");
