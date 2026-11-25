@@ -1053,7 +1053,7 @@ async function flushQueue(){
         saveQueue(loadQueue().slice(1));
         setSend("on","Saved at home and sent to Claude: "+item.path.split("/").pop()+" at "+new Date().toLocaleTimeString());
       }
-    }catch(err){ setSend("err","Couldn't reach your home server (no signal?). "+loadQueue().length+" result(s) will be sent later."); }
+    }catch(err){ setSend("err","Can't reach home: is the Tailscale app ON (Connected)? Or no signal. "+loadQueue().length+" result(s) are kept on this phone and sent by themselves once it connects."); }
     flushing=false; return;
   }
   if(!cfg.token){ if(q.length) setSend("busy", q.length+" result(s) waiting. Set up the key below to send them."); return; }
